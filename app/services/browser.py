@@ -1,12 +1,56 @@
 import asyncio
 import base64
+import functools
 import logging
+import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Windows fix: Playwright needs ProactorEventLoop (for subprocess transport)
+# but uvicorn uses SelectorEventLoop.  We run ALL Playwright operations on a
+# dedicated ProactorEventLoop in a background thread.
+# ---------------------------------------------------------------------------
+
+_pw_loop: asyncio.AbstractEventLoop | None = None
+_pw_thread_id: int | None = None
+
+
+def _start_pw_loop() -> None:
+    global _pw_loop, _pw_thread_id
+    _pw_loop = asyncio.ProactorEventLoop()
+    _pw_thread_id = threading.current_thread().ident
+    asyncio.set_event_loop(_pw_loop)
+    _pw_loop.run_forever()
+
+
+if sys.platform == "win32":
+    _t = threading.Thread(target=_start_pw_loop, daemon=True, name="PlaywrightLoop")
+    _t.start()
+    while _pw_loop is None:          # wait until the loop is ready
+        time.sleep(0.01)
+    logger.info("Playwright ProactorEventLoop thread started.")
+
+
+def _on_pw_loop(fn):
+    """Decorator: dispatch an async function to the Playwright ProactorEventLoop."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        if _pw_loop is None:
+            # Not on Windows — run directly
+            return await fn(*args, **kwargs)
+        if threading.current_thread().ident == _pw_thread_id:
+            # Already on the Playwright thread (nested call) — run directly
+            return await fn(*args, **kwargs)
+        future = asyncio.run_coroutine_threadsafe(fn(*args, **kwargs), _pw_loop)
+        return await asyncio.wrap_future(future)
+    return wrapper
 
 # ---------------------------------------------------------------------------
 # In-memory store of active browser sessions  { token: BrowserSession }
@@ -29,6 +73,7 @@ class BrowserSession:
 # Session lifecycle
 # ---------------------------------------------------------------------------
 
+@_on_pw_loop
 async def start_session(token: str, target_url: str | None) -> BrowserSession:
     """Launch a Chromium browser for this session and navigate to target_url."""
     pw = await async_playwright().start()
@@ -197,6 +242,7 @@ async def start_session(token: str, target_url: str | None) -> BrowserSession:
     return session
 
 
+@_on_pw_loop
 async def end_session(token: str) -> None:
     """Close browser and clean up session."""
     session = _sessions.pop(token, None)
@@ -218,6 +264,7 @@ def get_session(token: str) -> Optional[BrowserSession]:
 # Smart element finder — label-based first, CSS fallback
 # ---------------------------------------------------------------------------
 
+@_on_pw_loop
 async def _find_element(session: BrowserSession, selector: str):
     """
     Find an element using multiple strategies. Returns a Playwright Locator or CSS string.
@@ -324,6 +371,7 @@ async def _find_element(session: BrowserSession, selector: str):
     return selector
 
 
+@_on_pw_loop
 async def element_exists(session: BrowserSession, selector: str) -> bool:
     """
     Check if the selector resolves to an element that is truly visible and
@@ -449,6 +497,7 @@ async def element_exists(session: BrowserSession, selector: str) -> bool:
     return False
 
 
+@_on_pw_loop
 async def scan_page_fields(session: BrowserSession) -> list[dict]:
     """Scan the current page and return only truly visible interactive form fields."""
     page = session.page
@@ -580,6 +629,7 @@ async def scan_page_fields(session: BrowserSession) -> list[dict]:
         return []
 
 
+@_on_pw_loop
 async def wait_for_page_stable(session: BrowserSession, timeout_ms: int = 5000):
     """Wait for the page to be stable after a navigation or click."""
     page = session.page
@@ -596,6 +646,7 @@ async def wait_for_page_stable(session: BrowserSession, timeout_ms: int = 5000):
     await page.wait_for_timeout(500)
 
 
+@_on_pw_loop
 async def _resolve_locator(session: BrowserSession, resolved):
     """Convert a resolved selector (from _find_element) into a Playwright Locator."""
     page = session.page
@@ -617,6 +668,7 @@ async def _resolve_locator(session: BrowserSession, resolved):
 # Browser actions
 # ---------------------------------------------------------------------------
 
+@_on_pw_loop
 async def take_screenshot(session: BrowserSession) -> str:
     """Take a screenshot and return it as a base64-encoded JPEG string (faster, smaller than PNG)."""
     try:
@@ -627,6 +679,7 @@ async def take_screenshot(session: BrowserSession) -> str:
         return ""
 
 
+@_on_pw_loop
 async def highlight_element(session: BrowserSession, selector: str) -> bool:
     """Inject a glowing highlight border around the target element."""
     try:
@@ -688,6 +741,7 @@ async def highlight_element(session: BrowserSession, selector: str) -> bool:
         return False
 
 
+@_on_pw_loop
 async def prefill_input(session: BrowserSession, selector: str, value: str) -> bool:
     """Click an input field, clear it, and type a value with human-like delay."""
     try:
@@ -760,6 +814,7 @@ async def prefill_input(session: BrowserSession, selector: str, value: str) -> b
         return False
 
 
+@_on_pw_loop
 async def select_option(session: BrowserSession, selector: str, value: str) -> bool:
     """Select an option in a <select> dropdown or click a radio button, by label text."""
     page = session.page
@@ -887,6 +942,7 @@ async def select_option(session: BrowserSession, selector: str, value: str) -> b
     return False
 
 
+@_on_pw_loop
 async def click_element(session: BrowserSession, selector: str) -> bool:
     """Click an element found by label, role, or CSS selector."""
     try:
@@ -919,6 +975,7 @@ async def click_element(session: BrowserSession, selector: str) -> bool:
         return False
 
 
+@_on_pw_loop
 async def navigate_to(session: BrowserSession, url: str) -> bool:
     """Navigate the browser to a new URL."""
     try:

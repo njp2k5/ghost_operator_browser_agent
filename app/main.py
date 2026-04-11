@@ -1,5 +1,14 @@
+import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
+
+# ── Windows: force ProactorEventLoop so Playwright can spawn Chromium ──────────
+# SelectorEventLoop (uvicorn default on Windows) does NOT support subprocess
+# transport, which causes NotImplementedError() when Playwright tries to launch.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# ────────────────────────────────────────────────────────────────────────────────
 
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates

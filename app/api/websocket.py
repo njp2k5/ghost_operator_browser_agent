@@ -288,21 +288,32 @@ async def websocket_session(websocket: WebSocket, token: str):
     # ----------------------------------------------------------------
     # 2. Launch browser
     # ----------------------------------------------------------------
-    browser_session = None
+    # Always clean up any stale session for this token first
     try:
-        await websocket.send_json({"type": "status", "message": "Launching browser..."})
-        logger.info(f"[WS:{token}] Launching Playwright browser for: {s_target_url}")
+        await bm.end_session(token)
+    except Exception:
+        pass
 
-        browser_session = await bm.start_session(token, s_target_url)
-        logger.info(f"[WS:{token}] Browser launched successfully.")
-
-    except Exception as e:
-        logger.error(f"[WS:{token}] Browser launch FAILED: {e}\n{traceback.format_exc()}")
+    browser_session = None
+    for _attempt in range(2):  # retry once on transient failure
         try:
-            await websocket.send_json({"type": "error", "message": f"Failed to launch browser: {e}"})
-        except Exception:
-            pass
-        return
+            await websocket.send_json({"type": "status", "message": "Launching browser..."})
+            logger.info(f"[WS:{token}] Launching Playwright browser (attempt {_attempt+1}) for: {s_target_url}")
+
+            browser_session = await bm.start_session(token, s_target_url)
+            logger.info(f"[WS:{token}] Browser launched successfully.")
+            break  # success
+
+        except Exception as e:
+            err_detail = repr(e) if not str(e).strip() else str(e)
+            logger.error(f"[WS:{token}] Browser launch FAILED (attempt {_attempt+1}): {err_detail}\n{traceback.format_exc()}")
+            if _attempt == 1:  # both attempts failed
+                try:
+                    await websocket.send_json({"type": "error", "message": f"Failed to launch browser: {err_detail}"})
+                except Exception:
+                    pass
+                return
+            await asyncio.sleep(2)  # brief pause before retry
 
     # ----------------------------------------------------------------
     # 3. Process steps one by one
