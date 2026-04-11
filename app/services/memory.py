@@ -20,7 +20,7 @@ async def get_memory(user_id: str, task: str) -> dict | None:
     Returns the learned_flow dict if found, or None.
     """
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             response = await client.post(
                 f"{BASE_URL}/search",
                 headers=HEADERS,
@@ -53,9 +53,9 @@ async def save_memory(user_id: str, task: str, steps: list[dict], prefill_values
     content = json.dumps(payload)
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             response = await client.post(
-                f"{BASE_URL}/memories",
+                f"{BASE_URL}/documents",
                 headers=HEADERS,
                 json={
                     "content": content,
