@@ -314,6 +314,143 @@ async def _find_element(session: BrowserSession, selector: str):
     return selector
 
 
+async def element_exists(session: BrowserSession, selector: str) -> bool:
+    """Quick check: does the selector resolve to a visible element on the current page?"""
+    page = session.page
+    try:
+        # Try CSS directly
+        el = await page.query_selector(selector)
+        if el and await el.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_label(selector, exact=False)
+        if await loc.count() > 0 and await loc.first.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_placeholder(selector, exact=False)
+        if await loc.count() > 0 and await loc.first.is_visible():
+            return True
+    except Exception:
+        pass
+    try:
+        loc = page.get_by_role("button", name=selector, exact=False)
+        if await loc.count() > 0 and await loc.first.is_visible():
+            return True
+    except Exception:
+        pass
+    # Also try the JS label scan
+    try:
+        found = await page.evaluate("""(labelText) => {
+            const labels = document.querySelectorAll('label');
+            for (const lbl of labels) {
+                const text = lbl.textContent.replace(/[\\s*]+/g, ' ').trim().toLowerCase();
+                if (text.includes(labelText.toLowerCase())) return true;
+            }
+            // Also check placeholders
+            const inputs = document.querySelectorAll('input, textarea, select');
+            for (const inp of inputs) {
+                if (inp.placeholder && inp.placeholder.toLowerCase().includes(labelText.toLowerCase())) return true;
+            }
+            return false;
+        }""", selector)
+        if found:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def scan_page_fields(session: BrowserSession) -> list[dict]:
+    """Scan the current page and return a list of visible interactive form fields."""
+    page = session.page
+    try:
+        fields = await page.evaluate("""() => {
+            const results = [];
+            const seen = new Set();
+            
+            // Scan all visible inputs, textareas, selects
+            const elements = document.querySelectorAll('input, textarea, select');
+            for (const el of elements) {
+                if (el.type === 'hidden' || el.offsetParent === null) continue;
+                
+                let label = '';
+                let fieldType = 'fill';
+                
+                // Get label text
+                if (el.id) {
+                    const lbl = document.querySelector('label[for="' + el.id + '"]');
+                    if (lbl) label = lbl.textContent.replace(/[\\s*]+/g, ' ').trim();
+                }
+                if (!label) {
+                    const parentLabel = el.closest('label');
+                    if (parentLabel) label = parentLabel.textContent.replace(/[\\s*]+/g, ' ').trim();
+                }
+                if (!label && el.placeholder) label = el.placeholder;
+                if (!label && el.name) label = el.name;
+                if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
+                
+                // Determine type
+                if (el.tagName === 'SELECT') fieldType = 'select';
+                else if (el.type === 'radio' || el.type === 'checkbox') fieldType = 'select';
+                else if (el.type === 'submit') fieldType = 'click';
+                else fieldType = 'fill';
+                
+                // Skip duplicates
+                const key = label + '|' + fieldType;
+                if (seen.has(key) || !label) continue;
+                seen.add(key);
+                
+                results.push({
+                    label: label,
+                    type: fieldType,
+                    tag: el.tagName.toLowerCase(),
+                    inputType: el.type || '',
+                    name: el.name || '',
+                    id: el.id || ''
+                });
+            }
+            
+            // Also scan buttons
+            const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+            for (const btn of buttons) {
+                if (btn.offsetParent === null) continue;
+                const text = btn.textContent.trim() || btn.value || btn.getAttribute('aria-label') || '';
+                if (!text || text.length > 50) continue;
+                const key = text + '|click';
+                if (seen.has(key)) continue;
+                seen.add(key);
+                results.push({ label: text, type: 'click', tag: btn.tagName.toLowerCase(), inputType: '', name: '', id: btn.id || '' });
+            }
+            
+            return results;
+        }""")
+        logger.info(f"[{session.token}] Page scan found {len(fields)} fields: {[f['label'] for f in fields]}")
+        return fields
+    except Exception as e:
+        logger.warning(f"[{session.token}] scan_page_fields failed: {e}")
+        return []
+
+
+async def wait_for_page_stable(session: BrowserSession, timeout_ms: int = 5000):
+    """Wait for the page to be stable after a navigation or click."""
+    page = session.page
+    try:
+        # Wait for network to settle
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=3000)
+    except Exception:
+        pass
+    # Extra small wait for JS rendering
+    await page.wait_for_timeout(500)
+
+
 async def _resolve_locator(session: BrowserSession, resolved):
     """Convert a resolved selector (from _find_element) into a Playwright Locator."""
     page = session.page
@@ -336,10 +473,10 @@ async def _resolve_locator(session: BrowserSession, resolved):
 # ---------------------------------------------------------------------------
 
 async def take_screenshot(session: BrowserSession) -> str:
-    """Take a screenshot and return it as a base64-encoded PNG string."""
+    """Take a screenshot and return it as a base64-encoded JPEG string (faster, smaller than PNG)."""
     try:
-        png_bytes = await session.page.screenshot(type="png", full_page=False)
-        return base64.b64encode(png_bytes).decode("utf-8")
+        jpg_bytes = await session.page.screenshot(type="jpeg", quality=70, full_page=False)
+        return base64.b64encode(jpg_bytes).decode("utf-8")
     except Exception as e:
         logger.warning(f"[{session.token}] Screenshot failed: {e}")
         return ""

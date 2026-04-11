@@ -43,7 +43,8 @@
 
     <!-- Browser viewport -->
     <div class="flex-1 bg-black flex items-center justify-center overflow-hidden relative">
-      <canvas id="browser-canvas" class="max-w-full max-h-full object-contain"></canvas>
+      <!-- img tag renders JPEG directly — much faster than canvas -->
+      <img id="browser-view" class="max-w-full max-h-full object-contain" alt="Browser view" />
       <!-- Overlay when loading -->
       <div id="loading-overlay" class="absolute inset-0 bg-gray-950 flex flex-col items-center justify-center gap-4">
         <div id="loading-spinner" class="w-10 h-10 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
@@ -102,8 +103,9 @@
     // State
     // -----------------------------------------------------------------------
     const token   = "{{ token }}";
-    const canvas  = document.getElementById('browser-canvas');
-    const ctx     = canvas.getContext('2d');
+    const imgView = document.getElementById('browser-view');
+    let pendingFrame = null;   // latest b64 waiting to be rendered
+    let rafPending  = false;   // requestAnimationFrame in flight
     let currentAction = null;
     let ws = null;
 
@@ -179,6 +181,18 @@
         renderStep(msg);
         renderScreenshot(msg.screenshot);
         hideOverlay();
+      } else if (msg.type === 'replan') {
+        // LLM has re-planned the remaining steps — update total count
+        log('REPLAN: ' + msg.message + ' (new total=' + msg.new_total + ')');
+        document.getElementById('step-label').textContent = '🔄 ' + msg.message;
+        // Flash the step label cyan for visibility
+        const label = document.getElementById('step-label');
+        label.classList.add('text-cyan-400');
+        setTimeout(() => label.classList.remove('text-cyan-400'), 2000);
+      } else if (msg.type === 'field_not_found') {
+        renderFieldNotFound(msg);
+        renderScreenshot(msg.screenshot);
+        hideOverlay();
       } else if (msg.type === 'frame') {
         renderScreenshot(msg.screenshot);
       } else if (msg.type === 'complete') {
@@ -240,17 +254,49 @@
     }
 
     // -----------------------------------------------------------------------
-    // Render screenshot onto canvas
+    // Render field-not-found notice (auto-skipped step)
+    // -----------------------------------------------------------------------
+    function renderFieldNotFound(msg) {
+      currentAction = null;
+
+      // Progress bar
+      const pct = Math.round((msg.step_number / msg.total_steps) * 100);
+      document.getElementById('progress-bar').style.width = pct + '%';
+      document.getElementById('step-count').textContent   = `Step ${msg.step_number} / ${msg.total_steps}`;
+      document.getElementById('step-label').textContent   = `⏭ Skipped: "${msg.selector}" not on this page`;
+
+      // Instruction card — show as a warning
+      document.getElementById('action-icon').textContent    = '⚠️';
+      document.getElementById('action-label').textContent   = 'SKIPPED';
+      let noticeText = `"${msg.selector}" was not found on the current page. Auto-skipping...`;
+      if (msg.available_fields && msg.available_fields.length > 0) {
+        noticeText += `\n\nVisible fields: ${msg.available_fields.join(', ')}`;
+      }
+      document.getElementById('instruction-text').textContent = noticeText;
+      document.getElementById('instruction-card').classList.remove('hidden');
+
+      // Hide fill box and done button (auto-skip, no user action needed)
+      document.getElementById('fill-box').classList.add('hidden');
+      document.getElementById('done-btn').classList.add('hidden');
+      document.getElementById('complete-banner').classList.add('hidden');
+    }
+
+    // -----------------------------------------------------------------------
+    // Render screenshot — JPEG img tag via requestAnimationFrame (fastest path)
     // -----------------------------------------------------------------------
     function renderScreenshot(b64) {
       if (!b64) return;
-      const img = new Image();
-      img.onload = () => {
-        canvas.width  = img.width;
-        canvas.height = img.height;
-        ctx.drawImage(img, 0, 0);
-      };
-      img.src = 'data:image/png;base64,' + b64;
+      pendingFrame = b64;
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(() => {
+          if (pendingFrame) {
+            imgView.src = 'data:image/jpeg;base64,' + pendingFrame;
+            pendingFrame = null;
+          }
+          rafPending = false;
+        });
+      }
     }
 
     // -----------------------------------------------------------------------

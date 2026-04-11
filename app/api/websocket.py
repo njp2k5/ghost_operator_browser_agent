@@ -5,19 +5,20 @@ import traceback
 
 import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.session import Session, SessionStatus, Step, StepAction
 from app.services import browser as bm
+from app.services.llm import replan_remaining_steps
 from app.services.memory import save_memory
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-SCREENSHOT_INTERVAL = 0.35   # seconds between frames while waiting for user
+SCREENSHOT_INTERVAL = 0.12   # seconds between frames — JPEG allows much faster streaming
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,142 @@ async def _load_steps(db: AsyncSession, token: str) -> list[dict]:
             "is_done": s.is_done,
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Helper — check if remaining steps match current page
+# ---------------------------------------------------------------------------
+
+def _remaining_steps_match_page(remaining: list[dict], page_fields: list[dict]) -> bool:
+    """
+    Return True if the next non-click/wait step's selector is found among
+    visible page fields.  If the very next field-based step doesn't match,
+    the page has changed and we need a replan.
+    """
+    page_labels = {f.get("label", "").lower().strip() for f in page_fields if f.get("label")}
+    # Also index by partial match: "First name" should match a label containing "first name"
+    for step in remaining:
+        action = step.get("action", "")
+        selector = (step.get("selector") or "").lower().strip()
+        if action in ("fill", "select") and selector:
+            # Check if any page label contains/matches this selector
+            found = any(
+                selector in plbl or plbl in selector
+                for plbl in page_labels
+            )
+            return found  # judge by the FIRST field-based step
+        if action == "click" and selector:
+            # Buttons are trickier — check page buttons too
+            found = any(
+                selector in plbl or plbl in selector
+                for plbl in page_labels
+            )
+            return found
+    # Only wait/navigate steps remain — no mismatch
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Helper — replan: delete remaining DB steps, insert new ones from LLM
+# ---------------------------------------------------------------------------
+
+async def _do_replan(
+    token: str,
+    task: str,
+    completed_steps: list[dict],
+    page_fields: list[dict],
+    page_url: str,
+    next_step_num: int,
+) -> list[dict]:
+    """
+    Call the LLM to generate new remaining steps, persist them to DB,
+    and return the new steps as dicts (same format as _load_steps).
+    """
+    new_raw_steps = await replan_remaining_steps(
+        task=task,
+        completed_steps=completed_steps,
+        visible_fields=page_fields,
+        page_url=page_url,
+        next_step_number=next_step_num,
+    )
+    logger.info(f"[WS:{token}] LLM replan returned {len(new_raw_steps)} raw steps")
+
+    # ---- Validate: keep only steps whose selector is actually visible on page ----
+    # This prevents the LLM from hallucinating fields that don't exist yet.
+    if page_fields:
+        visible_labels = {f.get("label", "").lower().strip() for f in page_fields if f.get("label")}
+
+        def _selector_visible(step: dict) -> bool:
+            sel = (step.get("selector") or "").lower().strip()
+            action = step.get("action", "")
+            if not sel or action in ("navigate", "wait"):
+                return True  # non-field steps always pass
+            # Accept if any visible label contains selector OR selector contains label
+            return any(sel in lbl or lbl in sel for lbl in visible_labels)
+
+        validated = [s for s in new_raw_steps if _selector_visible(s)]
+        if validated:
+            new_raw_steps = validated
+            logger.info(f"[WS:{token}] After validation: {len(new_raw_steps)} steps kept (visible fields: {list(visible_labels)[:8]})")
+        else:
+            # All were hallucinated — fall back to a generic wait step
+            logger.warning(f"[WS:{token}] All replanned steps failed validation — generating wait step")
+            new_raw_steps = [{
+                "step_number": next_step_num,
+                "action": "wait",
+                "selector": None,
+                "instruction": "Follow the instructions shown on the page.",
+                "url": None,
+                "prefill_value": None,
+            }]
+
+    logger.info(f"[WS:{token}] Final replan: {len(new_raw_steps)} steps")
+
+    # Persist to DB: delete old remaining, insert new
+    new_step_dicts = []
+    async with AsyncSessionLocal() as db:
+        # Delete all undone steps for this session
+        await db.execute(
+            delete(Step).where(Step.session_token == token, Step.is_done == False)
+        )
+
+        for s in new_raw_steps:
+            action_str = s.get("action", "wait").lower()
+            try:
+                action_enum = StepAction(action_str)
+            except ValueError:
+                action_enum = StepAction.WAIT
+
+            step = Step(
+                session_token=token,
+                step_number=s.get("step_number", next_step_num),
+                action=action_enum,
+                selector=s.get("selector"),
+                instruction=s.get("instruction", "Follow the instructions on screen."),
+                prefill_value=s.get("prefill_value"),
+                url=s.get("url"),
+                is_skippable=s.get("is_skippable", False),
+                is_done=False,
+            )
+            db.add(step)
+            # We need the ID after flush
+            await db.flush()
+
+            new_step_dicts.append({
+                "id": step.id,
+                "step_number": step.step_number,
+                "action": action_str,
+                "selector": step.selector,
+                "instruction": step.instruction,
+                "prefill_value": step.prefill_value,
+                "url": step.url,
+                "is_skippable": step.is_skippable,
+                "is_done": False,
+            })
+
+        await db.commit()
+
+    return new_step_dicts
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +277,15 @@ async def websocket_session(websocket: WebSocket, token: str):
 
         await websocket.send_json({"type": "status", "message": f"Browser ready. Processing {total_steps} steps..."})
 
-        for step in steps:
+        # Use index-based loop so we can swap the step list mid-flight
+        step_idx = 0
+        last_frame_hash = ""  # skip sending duplicate frames
+        # Replan guard: after a replan, trust the new steps for their full batch
+        # without re-running element_exists (prevents infinite replan loops).
+        replan_grace_remaining = 0   # how many replanned steps still get a free pass
+        last_replan_url = ""         # never replan on the same URL twice in a row
+        while step_idx < len(steps):
+            step = steps[step_idx]
             step_num    = step["step_number"]
             action      = step["action"]
             selector    = step["selector"]
@@ -149,12 +294,84 @@ async def websocket_session(websocket: WebSocket, token: str):
             url         = step["url"]
             is_skip     = step["is_skippable"]
             step_id     = step["id"]
+            total_steps = len(steps)  # refresh — may change after replan
 
             if step["is_done"]:
                 logger.info(f"[WS:{token}] Step {step_num} already done, skipping.")
+                step_idx += 1
                 continue
 
             logger.info(f"[WS:{token}] === Step {step_num}/{total_steps}: action={action}, selector={selector}, url={url}")
+
+            # ----- Check if the field actually exists on the current page -----
+            field_found = True
+            current_page_url = browser_session.page.url
+            if replan_grace_remaining > 0:
+                # Still inside a replan grace window — trust the new steps, no element_exists check
+                logger.info(f"[WS:{token}] Grace period active ({replan_grace_remaining} left) — skipping element_exists for '{selector}'")
+            elif selector and action in ("fill", "select", "click"):
+                field_found = await bm.element_exists(browser_session, selector)
+
+            # ----- If field not found → trigger dynamic replan (once per URL) -----
+            if not field_found:
+                if current_page_url == last_replan_url:
+                    # Already replanned on this page — don't loop. Skip this step instead.
+                    logger.warning(f"[WS:{token}] Field '{selector}' still missing after replan on same URL — skipping step.")
+                    step["is_done"] = True
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            await db.execute(update(Step).where(Step.id == step_id).values(is_done=True))
+                            await db.commit()
+                    except Exception:
+                        pass
+                    step_idx += 1
+                    continue
+
+                logger.warning(f"[WS:{token}] Field '{selector}' NOT FOUND — triggering replan...")
+                try:
+                    await websocket.send_json({"type": "status", "message": "🔄 Page changed — replanning steps..."})
+                    page_fields = await bm.scan_page_fields(browser_session)
+                    page_url = current_page_url
+
+                    # Gather completed steps (everything before current index that's done)
+                    completed = [s for s in steps if s["is_done"]]
+
+                    new_steps = await _do_replan(
+                        token=token,
+                        task=s_task,
+                        completed_steps=completed,
+                        page_fields=page_fields,
+                        page_url=page_url,
+                        next_step_num=step_num,
+                    )
+
+                    if new_steps:
+                        # Replace remaining portion of the step list
+                        steps = [s for s in steps if s["is_done"]] + new_steps
+                        total_steps = len(steps)
+                        # Find the new index to continue from
+                        step_idx = next(
+                            (i for i, s in enumerate(steps) if not s["is_done"]),
+                            len(steps),
+                        )
+                        # Set grace period — trust ALL new replanned steps without element_exists
+                        replan_grace_remaining = len(new_steps)
+                        last_replan_url = page_url
+                        logger.info(f"[WS:{token}] Replan complete: {len(new_steps)} new steps, grace={replan_grace_remaining}, url={page_url}")
+                        await websocket.send_json({
+                            "type": "replan",
+                            "message": f"Adjusted plan — {len(new_steps)} steps remaining.",
+                            "new_total": total_steps,
+                        })
+                        continue  # restart loop with new steps
+                    else:
+                        logger.warning(f"[WS:{token}] Replan returned empty — skipping step.")
+                        step_idx += 1
+                        continue
+                except Exception as replan_err:
+                    logger.error(f"[WS:{token}] Replan failed: {replan_err}\n{traceback.format_exc()}")
+                    step_idx += 1
+                    continue
 
             # ----- Execute the step action (each wrapped individually) -----
             try:
@@ -162,9 +379,9 @@ async def websocket_session(websocket: WebSocket, token: str):
                     await websocket.send_json({"type": "status", "message": f"Opening {url}..."})
                     result = await bm.navigate_to(browser_session, url)
                     logger.info(f"[WS:{token}] navigate result: {result}")
+                    await bm.wait_for_page_stable(browser_session)
 
                 elif action == "fill" and selector:
-                    # Highlight the field, prefill if value provided
                     await bm.highlight_element(browser_session, selector)
                     if prefill:
                         await bm.prefill_input(browser_session, selector, prefill)
@@ -172,7 +389,6 @@ async def websocket_session(websocket: WebSocket, token: str):
                         logger.info(f"[WS:{token}] prefilled '{selector}' with '{prefill}'")
 
                 elif action == "select" and selector:
-                    # Highlight the field; auto-select if prefill value exists
                     await bm.highlight_element(browser_session, selector)
                     if prefill:
                         await bm.select_option(browser_session, selector, prefill)
@@ -184,7 +400,6 @@ async def websocket_session(websocket: WebSocket, token: str):
                     logger.info(f"[WS:{token}] highlighted click target '{selector}'")
 
                 elif action == "highlight" and selector:
-                    # Legacy highlight steps — just highlight
                     await bm.highlight_element(browser_session, selector)
                     logger.info(f"[WS:{token}] highlight '{selector}'")
 
@@ -196,14 +411,13 @@ async def websocket_session(websocket: WebSocket, token: str):
 
             except Exception as step_err:
                 logger.warning(f"[WS:{token}] Step {step_num} action error (non-fatal): {step_err}")
-                # Continue anyway — still show the step to user
 
             # ----- Send step info + screenshot to frontend -----
             try:
                 screenshot = await bm.take_screenshot(browser_session)
                 await websocket.send_json({
                     "type": "step",
-                    "step_number": step_num,
+                    "step_number": step_idx + 1,  # 1-based display number
                     "total_steps": total_steps,
                     "action": action,
                     "selector": selector,
@@ -236,10 +450,10 @@ async def websocket_session(websocket: WebSocket, token: str):
                         done = True
                         logger.info(f"[WS:{token}] User completed step {step_num}. value={user_value!r}")
                 except asyncio.TimeoutError:
-                    # Send a new screenshot frame
                     try:
                         screenshot = await bm.take_screenshot(browser_session)
-                        if screenshot:
+                        if screenshot and screenshot != last_frame_hash:
+                            last_frame_hash = screenshot
                             await websocket.send_json({
                                 "type": "frame",
                                 "screenshot": screenshot,
@@ -254,9 +468,9 @@ async def websocket_session(websocket: WebSocket, token: str):
                     return
 
             # ----- After user presses Done: execute the real action -----
+            needs_replan_check = False
             try:
                 if action == "fill" and selector:
-                    # Type the user's value (or prefill) into the browser field
                     value_to_type = user_value or prefill or ""
                     if value_to_type:
                         await bm.prefill_input(browser_session, selector, value_to_type)
@@ -267,7 +481,6 @@ async def websocket_session(websocket: WebSocket, token: str):
                             await websocket.send_json({"type": "frame", "screenshot": screenshot})
 
                 elif action == "select" and selector:
-                    # Select the user's value or prefill in dropdown/radio
                     value_to_select = user_value or prefill or ""
                     if value_to_select:
                         await bm.select_option(browser_session, selector, value_to_select)
@@ -278,34 +491,80 @@ async def websocket_session(websocket: WebSocket, token: str):
                             await websocket.send_json({"type": "frame", "screenshot": screenshot})
 
                 elif action == "click" and selector:
-                    # Actually click the element in the browser
                     await bm.click_element(browser_session, selector)
                     logger.info(f"[WS:{token}] Clicked '{selector}'")
-                    # Wait for page to react
-                    await asyncio.sleep(1.5)
+                    await bm.wait_for_page_stable(browser_session)
+                    await asyncio.sleep(1.0)
                     screenshot = await bm.take_screenshot(browser_session)
                     if screenshot:
                         await websocket.send_json({"type": "frame", "screenshot": screenshot})
+                    needs_replan_check = True  # click may have changed the page
 
             except Exception as post_err:
                 logger.warning(f"[WS:{token}] Post-action error (non-fatal): {post_err}")
 
             # ----- Mark step done in DB -----
+            step["is_done"] = True  # update in-memory too
+            if replan_grace_remaining > 0:
+                replan_grace_remaining -= 1
+                logger.info(f"[WS:{token}] Grace remaining after step: {replan_grace_remaining}")
             try:
                 async with AsyncSessionLocal() as db:
                     await db.execute(
-                        update(Step)
-                        .where(Step.id == step_id)
-                        .values(is_done=True)
+                        update(Step).where(Step.id == step_id).values(is_done=True)
                     )
                     await db.execute(
-                        update(Session)
-                        .where(Session.token == token)
-                        .values(current_step=step_num + 1)
+                        update(Session).where(Session.token == token).values(current_step=step_num + 1)
                     )
                     await db.commit()
             except Exception as db_err:
                 logger.warning(f"[WS:{token}] DB update after step {step_num} failed: {db_err}")
+
+            # ----- After click: proactively check if remaining steps match the new page -----
+            # Only run if grace period is exhausted (prevents re-triggering right after a replan)
+            if needs_replan_check and replan_grace_remaining == 0:
+                post_click_url = browser_session.page.url
+                if post_click_url == last_replan_url:
+                    logger.info(f"[WS:{token}] Post-click: same URL as last replan, skipping mismatch check.")
+                else:
+                    remaining = [s for s in steps if not s["is_done"]]
+                    if remaining:
+                        page_fields = await bm.scan_page_fields(browser_session)
+                        if page_fields and not _remaining_steps_match_page(remaining, page_fields):
+                            logger.info(f"[WS:{token}] Post-click page mismatch detected — replanning...")
+                            try:
+                                await websocket.send_json({"type": "status", "message": "🔄 Page changed — replanning steps..."})
+                                completed = [s for s in steps if s["is_done"]]
+                                next_num = step_num + 1
+
+                                new_steps = await _do_replan(
+                                    token=token,
+                                    task=s_task,
+                                    completed_steps=completed,
+                                    page_fields=page_fields,
+                                    page_url=post_click_url,
+                                    next_step_num=next_num,
+                                )
+                                if new_steps:
+                                    steps = [s for s in steps if s["is_done"]] + new_steps
+                                    total_steps = len(steps)
+                                    step_idx = next(
+                                        (i for i, s in enumerate(steps) if not s["is_done"]),
+                                        len(steps),
+                                    )
+                                    replan_grace_remaining = len(new_steps)
+                                    last_replan_url = post_click_url
+                                    logger.info(f"[WS:{token}] Post-click replan: {len(new_steps)} new steps, grace={replan_grace_remaining}")
+                                    await websocket.send_json({
+                                        "type": "replan",
+                                        "message": f"Adjusted plan — {len(new_steps)} steps remaining.",
+                                        "new_total": total_steps,
+                                    })
+                                    continue  # restart loop with new steps
+                            except Exception as rp_err:
+                                logger.warning(f"[WS:{token}] Post-click replan failed: {rp_err}")
+
+            step_idx += 1
 
         # ----------------------------------------------------------------
         # 4. All steps done — mark session COMPLETE

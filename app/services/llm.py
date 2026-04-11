@@ -50,6 +50,32 @@ Do NOT include markdown or explanation — ONLY the raw JSON array.
 """
 
 
+REPLAN_PROMPT = """You are a web automation planner. The user is in the middle of a task and the page has changed unexpectedly.
+
+You must generate NEW remaining steps based on what is ACTUALLY visible on the page right now.
+
+IMPORTANT: Do NOT repeat steps that were already completed. Do NOT include a "navigate" step — the user is already on the page.
+
+Each step must follow this exact schema:
+{{
+  "step_number": <int — start from {next_step_number}>,
+  "action": <"fill" | "select" | "click" | "wait">,
+  "selector": <label text of the visible field>,
+  "instruction": <short human-readable instruction shown to user>,
+  "url": null,
+  "prefill_value": <value to pre-fill or select, or null>
+}}
+
+RULES:
+- ONLY use fields that are in the "Visible fields" list below. Do NOT invent fields that aren't there.
+- For text inputs: action = "fill", selector = the label text.
+- For dropdowns / radio buttons: action = "select", selector = label text, prefill_value = option text.
+- For buttons: action = "click", selector = button text.
+- Keep the plan MINIMAL. One step per visible field.
+- Do NOT include markdown, code fences, or explanation — ONLY the raw JSON array.
+"""
+
+
 async def generate_steps(
     task: str,
     context: str,
@@ -83,6 +109,58 @@ async def generate_steps(
 
     raw = response.choices[0].message.content.strip()
     steps = _parse_json_steps(raw)
+    return steps
+
+
+async def replan_remaining_steps(
+    task: str,
+    completed_steps: list[dict],
+    visible_fields: list[dict],
+    page_url: str = "",
+    next_step_number: int = 1,
+) -> list[dict]:
+    """
+    Call the LLM to dynamically re-plan remaining steps based on what is
+    ACTUALLY visible on the current page.  Used when the page changes
+    unexpectedly (e.g. verification code screen, multi-step wizard).
+    """
+    # Build a readable summary of what was already done
+    done_summary = "\n".join(
+        f"  Step {s.get('step_number')}: [{s.get('action')}] {s.get('instruction')}"
+        for s in completed_steps
+    )
+    # Build a readable list of visible fields
+    fields_summary = "\n".join(
+        f"  - \"{f.get('label')}\" (type={f.get('type')}, tag={f.get('tag')}, inputType={f.get('inputType', '')})"
+        for f in visible_fields
+    )
+
+    system = REPLAN_PROMPT.format(next_step_number=next_step_number)
+    user_content = (
+        f"Task: {task}\n"
+        f"Current page URL: {page_url}\n\n"
+        f"Steps already completed:\n{done_summary}\n\n"
+        f"Visible fields on the current page:\n{fields_summary}\n\n"
+        f"Generate the remaining steps starting from step_number {next_step_number}."
+    )
+
+    response = await client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.2,
+        max_tokens=1024,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    steps = _parse_json_steps(raw)
+
+    # Safety: renumber from next_step_number
+    for i, s in enumerate(steps):
+        s["step_number"] = next_step_number + i
+
     return steps
 
 
