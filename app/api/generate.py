@@ -22,6 +22,7 @@ class GenerateLinkRequest(BaseModel):
     user_id: str
     task: str
     context: str = ""
+    target_url: str = ""   # The exact URL to open — passed to LLM so it won't guess
 
 
 class GenerateLinkResponse(BaseModel):
@@ -50,6 +51,7 @@ async def generate_link(payload: GenerateLinkRequest, db: AsyncSession = Depends
     steps_data = await generate_steps(
         task=payload.task,
         context=payload.context,
+        target_url=payload.target_url,
         learned_flow=learned_flow,
     )
 
@@ -59,11 +61,18 @@ async def generate_link(payload: GenerateLinkRequest, db: AsyncSession = Depends
     # 3. Create session token
     token = generate_session_token()
 
-    # 4. Determine target URL (first navigate step)
-    target_url = next(
+    # 4. Determine target URL — prefer caller-provided URL, fall back to LLM's first navigate step
+    target_url = payload.target_url or next(
         (s.get("url") for s in steps_data if s.get("action") == "navigate" and s.get("url")),
         None,
     )
+
+    # Fix the first navigate step to use the exact target_url (not the LLM's guess)
+    if target_url:
+        for s in steps_data:
+            if s.get("action") == "navigate":
+                s["url"] = target_url
+                break
 
     # 5. Persist session to PostgreSQL
     session = Session(

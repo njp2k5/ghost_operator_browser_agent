@@ -28,6 +28,7 @@ class StepAction(str, enum.Enum):
     NAVIGATE = "navigate"     # open a URL
     HIGHLIGHT = "highlight"   # glow an element to draw attention
     FILL = "fill"             # type into an input
+    SELECT = "select"         # select dropdown option or radio button
     CLICK = "click"           # click a button/link
     WAIT = "wait"             # wait for user acknowledgement
 

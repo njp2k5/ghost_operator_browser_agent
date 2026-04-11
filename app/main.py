@@ -6,6 +6,8 @@ from fastapi.templating import Jinja2Templates
 
 from app.core.database import create_tables
 
+# Configure root logger so all our logger.info/warning/error calls appear in console
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:  %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -26,13 +28,11 @@ app = FastAPI(
 
 templates = Jinja2Templates(directory="app/templates")
 
-from app.api import generate
+from app.api import generate, guide, websocket
 app.include_router(generate.router)
+app.include_router(guide.router)
+app.include_router(websocket.router)
 
-# Routers added in later steps:
-# from app.api import guide, websocket
-# app.include_router(guide.router)
-# app.include_router(websocket.router)
 
 
 @app.get("/health")
