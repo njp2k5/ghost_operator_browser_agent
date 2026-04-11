@@ -331,34 +331,48 @@ async def _dispatch_inline_tool(
     if tool_name == "olx_search":
         query = str(params.get("query") or original_message).strip()
         limit = max(1, min(int(params.get("limit") or 5), 20))
-        await manager.send(sender, f"Searching OLX for '{query}'...")
+        await manager.send(sender, f"🔍 Got it! Looking up OLX India for *{query}*...")
+        await manager.send(sender, "📡 Connecting to DuckDuckGo and scanning OLX listings...")
         try:
             results = await _fetch_olx_results(query, limit)
         except Exception as exc:  # noqa: BLE001
             return f"OLX search failed: {exc}"
+        if results:
+            await manager.send(sender, f"✅ Found {len(results)} listing(s)! Formatting results...")
+        else:
+            await manager.send(sender, "⚠️ No direct matches found, compiling what I have...")
         return _format_olx_reply(results, query)
 
     if tool_name == "irctc_search":
         query = str(params.get("query") or original_message).strip()
         limit = max(1, min(int(params.get("limit") or 5), 10))
-        await manager.send(sender, f"Searching IRCTC for '{query}'...")
+        await manager.send(sender, f"🚂 On it! Searching IRCTC for *{query}*...")
+        await manager.send(sender, "📡 Querying IRCTC via public rail database...")
         try:
             results = await _fetch_irctc_results(query, limit)
         except Exception:  # noqa: BLE001
             results = []
         if not results:
+            await manager.send(sender, "🔄 Live search returned nothing, falling back to IRCTC catalog...")
             intent = _detect_intent(query)
             results = _fallback_irctc_results(query, intent, limit)
+        else:
+            await manager.send(sender, f"✅ Got {len(results)} IRCTC result(s)! Packaging them up...")
         return _format_irctc_reply(results, query)
 
     if tool_name == "hindu_news":
         section = str(params.get("section") or "national").strip().lower()
         limit = max(1, min(int(params.get("limit") or 5), 15))
-        await manager.send(sender, f"Fetching The Hindu {section} news...")
+        await manager.send(sender, f"📰 Fetching latest *{section}* headlines from The Hindu...")
+        await manager.send(sender, "📡 Connecting to The Hindu RSS feed...")
         try:
             results = await _fetch_hindu_news(section, limit)
         except Exception as exc:  # noqa: BLE001
             return f"The Hindu news fetch failed: {exc}"
+        if results:
+            await manager.send(sender, f"✅ Pulled {len(results)} fresh article(s)! Formatting...")
+        else:
+            await manager.send(sender, "⚠️ Feed returned empty, The Hindu may be temporarily unavailable.")
         return _format_hindu_reply(results, section)
 
     return ""
@@ -397,6 +411,11 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
                         reply = "I could not retrieve results for your query. Please try again."
                 else:
                     # Registry tools (e.g. amazon_search) — go through tool executor
+                    if tool_name == "amazon_search":
+                        _q = str(tool_params.get("query") or message).strip()
+                        await manager.send(sender, f"🛒 Launching Amazon search agent for *{_q}*...")
+                        await manager.send(sender, "🌐 Opening Amazon India in headless browser...")
+                        await manager.send(sender, "🔎 Scanning product listings and extracting prices...")
                     tool_result = await execute_tool(tool_name, tool_params)
                     reply = _build_tool_reply(tool_name, tool_result)
 

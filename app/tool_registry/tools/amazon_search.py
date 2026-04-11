@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import re
+import sys
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
@@ -278,6 +281,24 @@ async def _extract_results(page, query: str, marketplace: str, limit: int) -> li
 
 
 async def run(params: dict[str, Any]) -> dict[str, Any]:
+    """Entry point — dispatches Playwright work to a ProactorEventLoop thread."""
+    running_loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        def _thread():
+            if sys.platform == "win32":
+                new_loop = asyncio.ProactorEventLoop()
+            else:
+                new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(_playwright_run(params))
+            finally:
+                new_loop.close()
+                asyncio.set_event_loop(None)
+        return await running_loop.run_in_executor(pool, _thread)
+
+
+async def _playwright_run(params: dict[str, Any]) -> dict[str, Any]:
     query = str(params.get("query", "")).strip()
     if not query:
         return {
