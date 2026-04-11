@@ -1,0 +1,28 @@
+# Web Framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+
+# Database
+sqlalchemy==2.0.40
+asyncpg==0.30.0
+alembic==1.15.2
+psycopg2-binary==2.9.10
+
+# Browser Automation
+playwright==1.51.0
+
+# LLM - Groq (Llama 3.1 8B Instant)
+groq==0.23.0
+
+# Memory
+requests==2.32.3
+
+# Templating
+jinja2==3.1.6
+
+# Utilities
+python-dotenv==1.1.0
+httpx==0.28.1
+python-multipart==0.0.20
+python-jose[cryptography]==3.4.0
+websockets==15.0.1
