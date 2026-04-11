@@ -237,12 +237,19 @@
       const fillBox = document.getElementById('fill-box');
       if (msg.action === 'fill') {
         fillBox.classList.remove('hidden');
-        document.getElementById('fill-input').value = '';
-        document.getElementById('fill-input').placeholder = 'Type your value here...';
-        document.getElementById('fill-input').focus();
+        const inp = document.getElementById('fill-input');
+        // Pre-populate with prefill value so user can see & confirm
+        inp.value = msg.prefill_value || '';
+        if (msg.prefill_value) {
+          inp.placeholder = 'Confirm or change the value, then press Done...';
+          inp.select();  // select all so user can easily replace
+        } else {
+          inp.placeholder = 'Type your value here...';
+        }
+        inp.focus();
       } else if (msg.action === 'select') {
         fillBox.classList.remove('hidden');
-        document.getElementById('fill-input').value = '';
+        document.getElementById('fill-input').value = msg.prefill_value || '';
         document.getElementById('fill-input').placeholder = 'Change value or press Done to accept...';
       } else {
         fillBox.classList.add('hidden');

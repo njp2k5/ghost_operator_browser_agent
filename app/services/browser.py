@@ -1138,54 +1138,81 @@ async def booking_execute_step(session: BrowserSession, step_selector: str, valu
 
         # ── DATES (calendar picker) ────────────────────────────────
         elif sel == "dates":
-            # Open calendar via JS click to bypass overlays
-            await page.evaluate("""() => {
-                const btn = document.querySelector('[data-testid="searchbox-dates-container"]');
-                if (btn) btn.click();
-            }""")
-            await page.wait_for_timeout(1200)
+            # After destination autocomplete Booking.com auto-opens the calendar.
+            # Check first — only click to open if it is NOT already open.
+            cal_already_open = await page.evaluate("""() =>
+                document.querySelectorAll('[data-date]').length > 0
+            """)
+
+            if cal_already_open:
+                logger.info(f"[{session.token}] booking: calendar already open ({cal_already_open} cells)")
+            else:
+                # Try multiple selectors to open it
+                opened = await page.evaluate("""() => {
+                    for (const s of [
+                        '[data-testid="searchbox-dates-container"]',
+                        '[data-testid="date-display-field-start"]',
+                    ]) {
+                        const el = document.querySelector(s);
+                        if (el) { el.click(); return s; }
+                    }
+                    return null;
+                }""")
+                logger.info(f"[{session.token}] booking: opened calendar via '{opened}'")
+                await page.wait_for_timeout(1500)
 
             # Parse "2026-05-10 to 2026-05-15"
             parts = value.replace(" to ", "|").replace(" - ", "|").replace(",", "|").split("|")
-            checkin = parts[0].strip() if len(parts) >= 1 else ""
+            checkin  = parts[0].strip() if len(parts) >= 1 else ""
             checkout = parts[1].strip() if len(parts) >= 2 else ""
 
             async def _navigate_and_click_date(date_str: str, label: str):
-                """Scroll the calendar forward month by month until the
-                [data-date] cell is visible, then click it."""
-                for attempt in range(14):  # up to ~14 months ahead
-                    # Check if the date cell exists in the current view
-                    found = await page.evaluate(f"""() => {{
+                """Advance calendar until the date cell is in the DOM, then
+                use page.mouse.click() with real screen coords — the only
+                method that fires trusted events that React accepts."""
+                for attempt in range(14):
+                    # Get real bounding box via JS
+                    bbox = await page.evaluate(f"""() => {{
                         const c = document.querySelector('[data-date="{date_str}"]');
-                        if (!c) return false;
+                        if (!c) return null;
                         const r = c.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0 && r.top > 0 && r.top < window.innerHeight;
+                        return {{x: r.x, y: r.y, w: r.width, h: r.height}};
                     }}""")
-                    if found:
-                        # Click via JS — guaranteed no overlay intercept
-                        await page.evaluate(f"""() => {{
-                            document.querySelector('[data-date="{date_str}"]').click();
-                        }}""")
-                        logger.info(f"[{session.token}] booking: clicked {label} {date_str} (attempt {attempt})")
-                        await page.wait_for_timeout(500)
+
+                    if bbox and bbox.get('w', 0) > 0:
+                        cx = bbox['x'] + bbox['w'] / 2
+                        cy = bbox['y'] + bbox['h'] / 2
+                        await page.mouse.click(cx, cy)
+                        logger.info(f"[{session.token}] booking: mouse.click {label} {date_str} at ({cx:.0f},{cy:.0f}) attempt {attempt}")
+                        await page.wait_for_timeout(700)
                         return True
 
-                    # Click the '>' next-month button (aria-label="Next month")
-                    clicked_next = await page.evaluate("""() => {
+                    # Cell not in DOM or off-screen — advance to next month
+                    nxt = await page.evaluate("""() => {
                         const btn = document.querySelector('button[aria-label="Next month"]');
                         if (btn) { btn.click(); return true; }
                         return false;
                     }""")
-                    if not clicked_next:
-                        logger.warning(f"[{session.token}] booking: no 'Next month' button found")
-                        break
-                    await page.wait_for_timeout(500)
+                    if not nxt:
+                        logger.warning(f"[{session.token}] booking: no 'Next month' button at attempt {attempt}")
+                        # One more chance: maybe calendar closed — reopen it
+                        if attempt == 0:
+                            await page.evaluate("""() => {
+                                const el = document.querySelector('[data-testid="searchbox-dates-container"]');
+                                if (el) el.click();
+                            }""")
+                            await page.wait_for_timeout(1000)
+                        else:
+                            break
+                    else:
+                        await page.wait_for_timeout(700)
 
-                logger.warning(f"[{session.token}] booking: could not find {label} {date_str} after scrolling")
+                logger.warning(f"[{session.token}] booking: {label} {date_str} not clicked after 14 attempts")
                 return False
 
             if checkin:
                 await _navigate_and_click_date(checkin, "check-in")
+                await page.wait_for_timeout(400)
             if checkout:
                 await _navigate_and_click_date(checkout, "check-out")
 

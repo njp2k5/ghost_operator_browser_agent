@@ -475,6 +475,7 @@ async def websocket_session(websocket: WebSocket, token: str):
                     "action": action,
                     "selector": selector,
                     "instruction": instruction,
+                    "prefill_value": prefill or "",
                     "is_skippable": is_skip,
                     "screenshot": screenshot,
                 })

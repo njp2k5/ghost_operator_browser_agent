@@ -100,7 +100,7 @@ def _build_booking_steps(task: str) -> list[dict]:
             "step_number": n, "action": "fill",
             "selector": "booking:dates",
             "url": None,
-            "instruction": f"Select check-in {checkin} and check-out {checkout} from the calendar.",
+            "instruction": f"Dates: check-in {checkin} → check-out {checkout}. The value is pre-filled — just press ✓ Done.",
             "prefill_value": f"{checkin} to {checkout}", "is_skippable": False,
         })
         n += 1
