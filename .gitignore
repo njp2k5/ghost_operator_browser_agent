@@ -1,0 +1,23 @@
+# Ignore Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+app/venv/
+app/__pycache__/
+app/*.pyc
+app/.env
+
+# Ignore Node artifacts
+node-app/node_modules/
+node-app/.wwebjs_auth/
+node-app/.wwebjs_cache/
+node-app/.env
+
+# Ignore editor and OS files
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
