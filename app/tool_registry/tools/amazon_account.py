@@ -5,6 +5,7 @@ import base64
 import concurrent.futures
 import json
 import os
+import logging
 import re
 import sys
 import threading
@@ -61,6 +62,29 @@ CONTINUE_SIGNALS = {
     "next",
     "ok done",
 }
+
+_LOG = logging.getLogger("ghost_operator.amazon_account")
+
+# ---------------------------------------------------------------------------
+# Stealth browser configuration
+# ---------------------------------------------------------------------------
+_STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-accelerated-2d-canvas",
+    "--no-first-run",
+    "--disable-infobars",
+    "--window-size=1366,900",
+]
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_STEALTH_EXTRA_HEADERS = {"Accept-Language": "en-IN,en;q=0.9"}
+_DEBUG_SCREENSHOT_DIR = Path.home() / ".ghost_operator_amazon_profiles" / "_debug"
 
 # ---------------------------------------------------------------------------
 # Persistent ProactorEventLoop worker
@@ -177,6 +201,48 @@ def _normalize_limit(value: Any) -> int:
     except (TypeError, ValueError) as exc:
         raise ValueError("'limit' must be a number") from exc
     return max(1, min(MAX_ORDER_LIMIT, limit))
+
+
+async def _page_diagnostic(page) -> str:
+    url = page.url
+    try:
+        title = await page.title()
+    except Exception:  # noqa: BLE001
+        title = "<n/a>"
+    return f"url={url!r} title={title!r}"
+
+
+async def _is_amazon_error_page(page) -> bool:
+    """Return True when Amazon shows its generic 'Something went wrong' error page."""
+    url = page.url.lower()
+    if "/errors/" in url or "somethingwentwrong" in url.replace("-", ""):
+        return True
+    try:
+        title = (await page.title()).lower()
+        if "something went wrong" in title:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        body = await page.locator("body").inner_text(timeout=3000)
+        low = body.lower()
+        if "something went wrong on our end" in low or "sorry, something went wrong" in low:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+async def _save_debug_screenshot(page, label: str) -> str:
+    """Save a full-page screenshot to the debug folder and return the path."""
+    try:
+        _DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        out_path = _DEBUG_SCREENSHOT_DIR / f"{label}_{ts}.png"
+        await page.screenshot(path=str(out_path), full_page=True)
+        return str(out_path)
+    except Exception as exc:  # noqa: BLE001
+        return f"<screenshot failed: {exc}>"
 
 
 def _signin_url(marketplace: str) -> str:
@@ -325,32 +391,38 @@ async def _new_session(
     headless: bool,
     storage_state: dict[str, Any] | None = None,
 ) -> AmazonSession:
+    _LOG.info(
+        "[%s] _new_session start — marketplace=%s headless=%s storage_state=%s",
+        session_id, marketplace, headless, storage_state is not None,
+    )
     await _close_session(session_id)
 
     playwright = await async_playwright().start()
     profile_dir = _session_profile_dir(session_id)
+    _LOG.info("[%s] profile_dir=%s", session_id, profile_dir)
+
     if storage_state is not None:
         browser = await playwright.chromium.launch(
             headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=80 if not headless else 0,
+            args=_STEALTH_ARGS,
+            slow_mo=50,
         )
         context = await browser.new_context(
             storage_state=storage_state,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=_STEALTH_UA,
             viewport={"width": 1366, "height": 900},
+            locale="en-IN",
         )
         page = await context.new_page()
     else:
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
             headless=headless,
-            args=["--disable-blink-features=AutomationControlled"],
-            slow_mo=80 if not headless else 0,
+            args=_STEALTH_ARGS,
+            slow_mo=50,
+            user_agent=_STEALTH_UA,
+            viewport={"width": 1366, "height": 900},
+            locale="en-IN",
         )
         page = context.pages[0] if context.pages else await context.new_page()
         browser = context.browser
@@ -358,9 +430,12 @@ async def _new_session(
     await context.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
     )
+    await context.set_extra_http_headers(_STEALTH_EXTRA_HEADERS)
     page.set_default_navigation_timeout(30000)
     page.set_default_timeout(12000)
+    _LOG.info("[%s] browser launched, navigating to signin page...", session_id)
     await _goto_signin(page, marketplace)
+    _LOG.info("[%s] signin page loaded: %s", session_id, await _page_diagnostic(page))
 
     session = AmazonSession(
         playwright=playwright,
@@ -381,11 +456,14 @@ async def _has_selector(page, selector: str) -> bool:
 
 
 async def _goto_signin(page, marketplace: str) -> None:
-    await page.goto(_signin_url(marketplace), wait_until="domcontentloaded")
+    url = _signin_url(marketplace)
+    _LOG.info("[goto_signin] navigating to %s", url)
+    await page.goto(url, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=7000)
     except PlaywrightTimeoutError:
         pass
+    _LOG.info("[goto_signin] loaded: %s", await _page_diagnostic(page))
 
 
 async def _first_selector(page, selectors: list[str]):
@@ -514,17 +592,26 @@ async def _extract_auth_error(page) -> str:
 
 async def _extract_orders(session: AmazonSession, limit: int) -> list[dict[str, str]]:
     page = session.page
+    _LOG.info("[orders] navigating to order history — marketplace=%s limit=%d", session.marketplace, limit)
     await page.goto(_orders_url(session.marketplace), wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=7000)
     except PlaywrightTimeoutError:
         pass
 
+    _LOG.info("[orders] page loaded: %s", await _page_diagnostic(page))
+
     if await _is_captcha(page):
+        _LOG.warning("[orders] CAPTCHA on orders page: %s", page.url)
+        return []
+
+    if await _is_amazon_error_page(page):
+        _LOG.warning("[orders] Amazon error page on orders page: %s", page.url)
         return []
 
     cards = page.locator("div.order-card, div.a-box-group.a-spacing-base.order")
     count = await cards.count()
+    _LOG.info("[orders] found %d order cards", count)
     seen: set[str] = set()
     orders: list[dict[str, str]] = []
 
@@ -574,6 +661,7 @@ async def _extract_orders(session: AmazonSession, limit: int) -> list[dict[str, 
             }
         )
 
+    _LOG.info("[orders] extracted %d orders", len(orders))
     return orders
 
 
@@ -590,6 +678,15 @@ async def _export_storage_state(session: AmazonSession) -> tuple[str, int]:
     return str(target), len(b64)
 
 
+async def _try_export_storage_state(session: AmazonSession) -> None:
+    """Silently save storage state after successful login so future sessions reuse it."""
+    try:
+        path, b64_len = await _export_storage_state(session)
+        _LOG.info("[export] storage state saved to %s (%d b64 chars)", path, b64_len)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("[export] failed to save storage state: %s", exc)
+
+
 def _extract_order_id(text: str) -> str:
     match = ORDER_ID_PATTERN.search(text)
     return match.group(0) if match else ""
@@ -602,12 +699,15 @@ def _is_orders_intent(text: str) -> bool:
 
 async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, Any]:
     page = session.page
+    _LOG.info("[email] start — page=%s input=%r", await _page_diagnostic(page), user_input[:40] if user_input else "")
     email_node = await _find_email_node(page)
     if email_node is None:
+        _LOG.info("[email] email input not found, re-navigating to signin")
         await _goto_signin(page, session.marketplace)
         email_node = await _find_email_node(page)
 
     if email_node is None:
+        _LOG.warning("[email] email input still not found after re-nav: %s", await _page_diagnostic(page))
         if await _is_captcha(page):
             return _result(
                 success=False,
@@ -637,6 +737,7 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
         ["#continue", "input#continue", "button#continue", "input[type='submit']"],
     )
     if continue_btn is not None:
+        _LOG.info("[email] clicking continue button")
         await continue_btn.click()
 
     try:
@@ -644,7 +745,29 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
     except PlaywrightTimeoutError:
         pass
 
+    _LOG.info("[email] post-submit page: %s", await _page_diagnostic(page))
+
+    if await _is_amazon_error_page(page):
+        screenshot = await _save_debug_screenshot(page, "email_error")
+        _LOG.warning("[email] Amazon error page after email submit. screenshot=%s", screenshot)
+        try:
+            await _goto_signin(page, session.marketplace)
+            session.stage = STAGE_AWAIT_EMAIL
+        except Exception:  # noqa: BLE001
+            pass
+        return _result(
+            success=False,
+            assistant_reply=(
+                "Amazon returned an error after your email (bot detection). "
+                "Please wait a moment and send your email again."
+            ),
+            stage=STAGE_AWAIT_EMAIL,
+            session_active=True,
+            awaiting_input=True,
+        )
+
     if await _is_captcha(page):
+        _LOG.warning("[email] CAPTCHA detected after email: %s", page.url)
         return _result(
             success=False,
             assistant_reply=(
@@ -657,6 +780,7 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
         )
 
     if await _is_password_step(page):
+        _LOG.info("[email] → password step")
         session.stage = STAGE_AWAIT_PASSWORD
         return _result(
             success=True,
@@ -667,6 +791,7 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
         )
 
     if await _is_otp_step(page):
+        _LOG.info("[email] → OTP step")
         session.stage = STAGE_AWAIT_OTP
         return _result(
             success=True,
@@ -677,6 +802,7 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
         )
 
     if await _is_signed_in(page):
+        _LOG.info("[email] → already signed in")
         session.stage = STAGE_AUTHENTICATED
         return _result(
             success=True,
@@ -686,6 +812,7 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
         )
 
     err = await _extract_auth_error(page)
+    _LOG.warning("[email] unrecognised state — error=%r page=%s", err, await _page_diagnostic(page))
     return _result(
         success=False,
         assistant_reply=err or "Email step failed. Please re-enter your Amazon email or mobile number.",
@@ -697,8 +824,10 @@ async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, An
 
 async def _handle_password(session: AmazonSession, user_input: str) -> dict[str, Any]:
     page = session.page
+    _LOG.info("[password] start — page=%s", await _page_diagnostic(page))
     pwd_node = await _first_selector(page, ["input#ap_password", "input[name='password']"])
     if pwd_node is None:
+        _LOG.warning("[password] password input not found: %s", await _page_diagnostic(page))
         return _result(
             success=False,
             assistant_reply="Password input is not visible. Please send your email again to restart login.",
@@ -710,6 +839,7 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
     await pwd_node.fill(user_input)
     sign_in_btn = await _first_selector(page, ["#signInSubmit", "input#signInSubmit", "input[type='submit']"])
     if sign_in_btn is not None:
+        _LOG.info("[password] clicking sign-in button")
         await sign_in_btn.click()
 
     try:
@@ -717,7 +847,30 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
     except PlaywrightTimeoutError:
         pass
 
+    _LOG.info("[password] post-submit page: %s", await _page_diagnostic(page))
+
+    if await _is_amazon_error_page(page):
+        screenshot = await _save_debug_screenshot(page, "password_error")
+        _LOG.warning("[password] Amazon error page after password submit. screenshot=%s", screenshot)
+        # Navigate back to sign-in so the session can retry
+        try:
+            await _goto_signin(page, session.marketplace)
+            session.stage = STAGE_AWAIT_EMAIL
+        except Exception:  # noqa: BLE001
+            pass
+        return _result(
+            success=False,
+            assistant_reply=(
+                "Amazon returned an error after your password — this is usually bot detection. "
+                "Please wait 30 seconds then send your email again to retry."
+            ),
+            stage=STAGE_AWAIT_EMAIL,
+            session_active=True,
+            awaiting_input=True,
+        )
+
     if await _is_otp_step(page):
+        _LOG.info("[password] → OTP step")
         session.stage = STAGE_AWAIT_OTP
         return _result(
             success=True,
@@ -728,6 +881,7 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
         )
 
     if await _is_signed_in(page):
+        _LOG.info("[password] → authenticated")
         session.stage = STAGE_AUTHENTICATED
         return _result(
             success=True,
@@ -737,6 +891,7 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
         )
 
     if await _is_captcha(page):
+        _LOG.warning("[password] CAPTCHA/challenge after password: %s", page.url)
         return _result(
             success=False,
             assistant_reply=(
@@ -749,6 +904,7 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
         )
 
     err = await _extract_auth_error(page)
+    _LOG.warning("[password] unrecognised state — error=%r page=%s", err, await _page_diagnostic(page))
     return _result(
         success=False,
         assistant_reply=err or "Password was not accepted. Please re-enter your password.",
@@ -760,11 +916,13 @@ async def _handle_password(session: AmazonSession, user_input: str) -> dict[str,
 
 async def _handle_otp(session: AmazonSession, user_input: str) -> dict[str, Any]:
     page = session.page
+    _LOG.info("[otp] start — page=%s", await _page_diagnostic(page))
     otp_node = await _first_selector(
         page,
         ["input[name='otpCode']", "input#cvf-input-code", "input[name='code']", "input[type='tel']"],
     )
     if otp_node is None:
+        _LOG.warning("[otp] OTP input not found: %s", await _page_diagnostic(page))
         return _result(
             success=False,
             assistant_reply="OTP input is not visible. Please try login again.",
@@ -784,6 +942,7 @@ async def _handle_otp(session: AmazonSession, user_input: str) -> dict[str, Any]
         ],
     )
     if submit_btn is not None:
+        _LOG.info("[otp] clicking submit")
         await submit_btn.click()
 
     try:
@@ -791,7 +950,29 @@ async def _handle_otp(session: AmazonSession, user_input: str) -> dict[str, Any]
     except PlaywrightTimeoutError:
         pass
 
+    _LOG.info("[otp] post-submit page: %s", await _page_diagnostic(page))
+
+    if await _is_amazon_error_page(page):
+        screenshot = await _save_debug_screenshot(page, "otp_error")
+        _LOG.warning("[otp] Amazon error page after OTP. screenshot=%s", screenshot)
+        try:
+            await _goto_signin(page, session.marketplace)
+            session.stage = STAGE_AWAIT_EMAIL
+        except Exception:  # noqa: BLE001
+            pass
+        return _result(
+            success=False,
+            assistant_reply=(
+                "Amazon returned an error after OTP. "
+                "Please wait a moment and send your email again to retry."
+            ),
+            stage=STAGE_AWAIT_EMAIL,
+            session_active=True,
+            awaiting_input=True,
+        )
+
     if await _is_signed_in(page):
+        _LOG.info("[otp] → authenticated")
         session.stage = STAGE_AUTHENTICATED
         return _result(
             success=True,
@@ -801,6 +982,7 @@ async def _handle_otp(session: AmazonSession, user_input: str) -> dict[str, Any]
         )
 
     if await _is_captcha(page):
+        _LOG.warning("[otp] CAPTCHA after OTP: %s", page.url)
         return _result(
             success=False,
             assistant_reply=(
@@ -812,6 +994,7 @@ async def _handle_otp(session: AmazonSession, user_input: str) -> dict[str, Any]
         )
 
     err = await _extract_auth_error(page)
+    _LOG.warning("[otp] unrecognised state — error=%r page=%s", err, await _page_diagnostic(page))
     return _result(
         success=False,
         assistant_reply=err or "OTP verification failed. Please enter the OTP again.",
@@ -938,7 +1121,14 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
     limit = _normalize_limit(params.get("limit"))
     storage_state = _resolve_storage_state(params)
 
+    _LOG.info(
+        "[run] session=%s command=%r user_input=%r marketplace=%s headless=%s storage_state=%s existing_session=%s",
+        session_id, command, user_input[:40] if user_input else "",
+        marketplace, headless, storage_state is not None, session_id in SESSIONS,
+    )
+
     if command in {"logout", "cancel"}:
+        _LOG.info("[run] logout command — closing session")
         await _close_session(session_id)
         return _result(
             success=True,
@@ -949,6 +1139,7 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
 
     session = SESSIONS.get(session_id)
     if session is None:
+        _LOG.info("[run] no existing session — creating new session")
         try:
             session = await _new_session(
                 session_id,
@@ -965,6 +1156,7 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
             )
 
         if await _is_signed_in(session.page):
+            _LOG.info("[run] new session — already signed in, setting authenticated")
             session.stage = STAGE_AUTHENTICATED
             if command in {"orders", "order_status"} or _is_orders_intent(user_input.lower()):
                 return await _handle_authenticated(session_id, session, user_input, command, limit)
@@ -979,6 +1171,7 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
             )
 
         if await _is_captcha(session.page):
+            _LOG.warning("[run] CAPTCHA on initial load: %s", session.page.url)
             if storage_state is not None:
                 return _result(
                     success=False,
@@ -1002,33 +1195,22 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
                 awaiting_input=True,
             )
 
-        if headless and storage_state is None:
-            return _result(
-                success=False,
-                assistant_reply=(
-                    "Headless deployment cannot reliably do first-time Amazon login. "
-                    "Provide pre-authenticated storage state via storage_state_b64/storage_state_path "
-                    "or env AMAZON_STORAGE_STATE_B64/AMAZON_STORAGE_STATE_PATH."
-                ),
-                stage=session.stage,
-                session_active=True,
-                awaiting_input=True,
-            )
-
+        _LOG.info("[run] new session — at email stage, page=%s", await _page_diagnostic(session.page))
         if user_input and _looks_like_email_or_mobile(user_input):
-            return await _handle_email(session, user_input)
+            result = await _handle_email(session, user_input)
+            if result.get("stage") == STAGE_AUTHENTICATED and result.get("success"):
+                await _try_export_storage_state(session)
+            return result
 
         return _result(
             success=True,
-            assistant_reply=(
-                "Let's login to Amazon. A visible browser session is recommended. "
-                "Please send your Amazon email or mobile number."
-            ),
+            assistant_reply="Let's login to your Amazon account. Please send your Amazon email or mobile number.",
             stage=session.stage,
             session_active=True,
             awaiting_input=True,
         )
 
+    _LOG.info("[run] existing session — stage=%s", session.stage)
     if session.stage == STAGE_AWAIT_EMAIL:
         if not user_input:
             return _result(
@@ -1039,8 +1221,12 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
                 awaiting_input=True,
             )
         if _is_continue_signal(user_input):
-            return await _continue_after_manual_action(session)
-        return await _handle_email(session, user_input)
+            result = await _continue_after_manual_action(session)
+        else:
+            result = await _handle_email(session, user_input)
+        if result.get("stage") == STAGE_AUTHENTICATED and result.get("success"):
+            await _try_export_storage_state(session)
+        return result
 
     if session.stage == STAGE_AWAIT_PASSWORD:
         if not user_input:
@@ -1052,8 +1238,12 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
                 awaiting_input=True,
             )
         if _is_continue_signal(user_input):
-            return await _continue_after_manual_action(session)
-        return await _handle_password(session, user_input)
+            result = await _continue_after_manual_action(session)
+        else:
+            result = await _handle_password(session, user_input)
+        if result.get("stage") == STAGE_AUTHENTICATED and result.get("success"):
+            await _try_export_storage_state(session)
+        return result
 
     if session.stage == STAGE_AWAIT_OTP:
         if not user_input:
@@ -1065,8 +1255,12 @@ async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
                 awaiting_input=True,
             )
         if _is_continue_signal(user_input):
-            return await _continue_after_manual_action(session)
-        return await _handle_otp(session, user_input)
+            result = await _continue_after_manual_action(session)
+        else:
+            result = await _handle_otp(session, user_input)
+        if result.get("stage") == STAGE_AUTHENTICATED and result.get("success"):
+            await _try_export_storage_state(session)
+        return result
 
     if session.stage == STAGE_AUTHENTICATED:
         return await _handle_authenticated(session_id, session, user_input, command, limit)
