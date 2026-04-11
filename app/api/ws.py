@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -17,6 +18,13 @@ from api.irctc_ws import _fetch_irctc_results, _fallback_irctc_results, _detect_
 
 router = APIRouter()
 AMAZON_ACCOUNT_ACTIVE_SESSIONS: set[str] = set()
+
+
+def _parse_order_limit(text: str, default: int = 5, cap: int = 10) -> int:
+    """Extract an explicit order count from the user's message."""
+    m = re.search(r'(\d+)\s*orders?', text, re.IGNORECASE) or \
+        re.search(r'(?:last|show|get|fetch|show\s+me)\s+(\d+)', text, re.IGNORECASE)
+    return max(1, min(int(m.group(1)), cap)) if m else default
 
 CHAT_SYSTEM_PROMPT = "WhatsApp AI assistant"
 
@@ -84,7 +92,21 @@ _INLINE_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "user_input": {"type": "string", "description": "User's message for the current login/order step"},
                 "command": {"type": "string", "description": "Optional: start, orders, order_status, logout"},
+                "limit": {"type": "integer", "description": "Number of orders to return (1-10)", "default": 5},
             },
+        },
+    },
+    {
+        "name": "practo_search",
+        "description": "Find doctors and specialists on Practo by city, speciality, and locality.",
+        "input_schema": {
+            "properties": {
+                "city": {"type": "string", "description": "City name (e.g. Bengaluru, Mumbai, Delhi)"},
+                "speciality": {"type": "string", "description": "Doctor speciality (e.g. dentist, dermatologist, cardiologist)", "default": ""},
+                "locality": {"type": "string", "description": "Locality or area (e.g. HSR Layout, Bandra)", "default": ""},
+                "limit": {"type": "integer", "description": "Number of doctors (1-20)", "default": 5},
+            },
+            "required": ["city"],
         },
     },
 ]
@@ -112,6 +134,7 @@ Rules:
 - For `amazon_account`, include params.session_id as sender id and params.user_input
     as the latest user message.
 - For `amazon_account`, prefer params.headless=false unless user explicitly asks for headless.
+- For `amazon_account`, if the user asks for a specific number of orders (e.g. "last 10 orders", "show me 3 orders"), set params.limit to that number (max 10). Otherwise omit it.
 - Use `amazon_search` for Amazon product discovery, price checks, and product comparisons.
   Set params.query to the product query. You may set params.limit (1-20) and params.marketplace.
 - Use `olx_search` for OLX India listings, second-hand goods, used products, used cars/bikes, buy/sell.
@@ -122,8 +145,8 @@ Rules:
   Set params.section to the best matching section from the available list. Optionally set params.limit.
 - Use `housing_search` for property listings, apartments, flats, rent/buy queries, real estate in Indian cities.
   Set params.city to the target city. Set params.purpose to rent or buy. Set params.query for extra keywords.
-- Use `practo_doctors` for doctor search, clinic search, specialist discovery, consultation fee checks.
-    Set params.city to the city name. You may set params.speciality, params.locality, and params.limit.
+- Use `practo_search` for doctor search, clinic search, specialist discovery, consultation fee queries.
+  Set params.city to the city name. Set params.speciality to the type of doctor (dentist, dermatologist etc). Set params.locality if mentioned.
 - If no tool is needed (general chat, greetings, opinions, calculations), return use_tool=false and tool="".
 """
 
@@ -396,6 +419,46 @@ def _format_hindu_reply(results: list[dict[str, Any]], section: str) -> str:
     return f"Latest The Hindu news ({section}):\n\n" + "\n\n".join(lines)
 
 
+def _format_practo_reply(result: dict[str, Any]) -> str:
+    if not result.get("success"):
+        error = str(result.get("error") or "Could not fetch doctor listings.")
+        city = str(result.get("city") or "").strip()
+        hint = f" Try browsing https://www.practo.com directly for {city}." if city else ""
+        return f"Could not find doctors right now: {error}.{hint}"
+
+    doctors = result.get("results") or []
+    if not doctors:
+        return "No doctors found on Practo for your search. Try adjusting the city or speciality."
+
+    city = str(result.get("city") or "your city").strip()
+    speciality = str(result.get("speciality") or "").strip()
+    header = f"🩺 Found {len(doctors)} doctor(s)"
+    header += f" ({speciality})" if speciality else ""
+    header += f" in {city}:"
+
+    lines: list[str] = []
+    for i, doc in enumerate(doctors, 1):
+        name = str(doc.get("title") or doc.get("name") or "Doctor").strip()
+        spec = str(doc.get("speciality") or "").strip()
+        exp = str(doc.get("experience") or "").strip()
+        fee = str(doc.get("fee") or "").strip()
+        location = str(doc.get("location") or "").strip()
+        clinic = str(doc.get("clinic") or "").strip()
+        rec = str(doc.get("recommendation") or "").strip()
+        url = str(doc.get("url") or "").strip()
+        meta = " | ".join(v for v in [spec, exp, fee] if v) or "details on site"
+        sub = " | ".join(v for v in [clinic, location] if v)
+        line = f"{i}. *{name}*\n   {meta}"
+        if sub:
+            line += f"\n   {sub}"
+        if rec:
+            line += f"\n   👍 {rec}"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    return header + "\n\n" + "\n\n".join(lines)
+
+
 def _format_housing_reply(result: dict[str, Any]) -> str:
     if not result.get("success"):
         error = str(result.get("error") or "Could not fetch property listings.")
@@ -530,13 +593,36 @@ async def _dispatch_inline_tool(
         AMAZON_ACCOUNT_ACTIVE_SESSIONS.add(sender)
         await manager.send(sender, "🛒 Starting Amazon account agent...")
         await manager.send(sender, "🌐 Opening headless browser and navigating to Amazon login...")
+        limit = max(1, min(int(params.get("limit") or 5), 10))
         result = await execute_tool(
             "amazon_account",
-            {"session_id": sender, "user_input": original_message, "command": params.get("command", "")},
+            {"session_id": sender, "user_input": original_message, "command": params.get("command", ""), "limit": limit},
         )
         if not result.get("session_active", True):
             AMAZON_ACCOUNT_ACTIVE_SESSIONS.discard(sender)
         return _format_amazon_account_reply(result)
+
+    if tool_name == "practo_search":
+        city = str(params.get("city") or "").strip()
+        if not city:
+            return "I need a city name to search for doctors. For example: *find a dentist in Bengaluru*."
+        speciality = str(params.get("speciality") or "").strip()
+        locality = str(params.get("locality") or "").strip()
+        limit = max(1, min(int(params.get("limit") or 5), 20))
+        display = " | ".join(v for v in [speciality or "doctors", locality, city] if v)
+        await manager.send(sender, f"🩺 Searching Practo for *{display}*...")
+        await manager.send(sender, "📡 Connecting to Practo.com and scanning doctor listings...")
+        await manager.send(sender, "🔍 Reading doctor profiles, experience, and fees...")
+        result = await execute_tool(
+            "practo_doctors",
+            {"city": city, "speciality": speciality, "locality": locality, "limit": limit},
+        )
+        count = result.get("count") or len(result.get("results") or [])
+        if result.get("success") and count:
+            await manager.send(sender, f"✅ Found {count} doctor(s)! Putting the list together...")
+        else:
+            await manager.send(sender, "⚠️ Live scrape returned nothing, loading fallback Practo links...")
+        return _format_practo_reply(result)
 
     return ""
 
@@ -572,6 +658,7 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
                     {
                         "session_id": sender,
                         "user_input": message,
+                        "limit": _parse_order_limit(message),
                     },
                 )
                 reply = _format_amazon_account_reply(tool_result)
