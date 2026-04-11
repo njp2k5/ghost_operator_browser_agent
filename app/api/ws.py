@@ -16,6 +16,7 @@ from api.hindu_ws import _fetch_hindu_news
 from api.irctc_ws import _fetch_irctc_results, _fallback_irctc_results, _detect_intent
 
 router = APIRouter()
+AMAZON_ACCOUNT_ACTIVE_SESSIONS: set[str] = set()
 
 CHAT_SYSTEM_PROMPT = "WhatsApp AI assistant"
 
@@ -83,6 +84,11 @@ Available tools:
 {tools_json}
 
 Rules:
+- Use `amazon_account` when the user wants to login to Amazon, provide OTP,
+    check order history, or ask order status.
+- For `amazon_account`, include params.session_id as sender id and params.user_input
+    as the latest user message.
+- For `amazon_account`, prefer params.headless=false unless user explicitly asks for headless.
 - Use `amazon_search` for Amazon product discovery, price checks, and product comparisons.
   Set params.query to the product query. You may set params.limit (1-20) and params.marketplace.
 - Use `olx_search` for OLX India listings, second-hand goods, used products, used cars/bikes, buy/sell.
@@ -151,9 +157,56 @@ def _format_amazon_tool_reply(tool_result: dict[str, Any]) -> str:
 
 
 def _build_tool_reply(tool_name: str, tool_result: dict[str, Any]) -> str:
+    if tool_name == "amazon_account":
+        reply = str(tool_result.get("assistant_reply") or "").strip()
+        if reply:
+            orders = tool_result.get("orders")
+            if isinstance(orders, list) and orders:
+                lines = [reply, "", "Recent orders:"]
+                for idx, item in enumerate(orders, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    order_id = str(item.get("order_id") or "").strip()
+                    status = str(item.get("status") or "Status unavailable").strip()
+                    title = str(item.get("title") or "").strip()
+                    detail_url = str(item.get("detail_url") or "").strip()
+
+                    descriptor = f"{idx}. {status}"
+                    if order_id:
+                        descriptor = f"{idx}. {order_id} - {status}"
+                    if title:
+                        descriptor += f" - {title}"
+                    if detail_url.startswith("http"):
+                        descriptor += f" - {detail_url}"
+
+                    lines.append(descriptor)
+                return "\n".join(lines)
+            return reply
+
+        if not tool_result.get("success"):
+            return str(tool_result.get("error") or "Amazon account action failed.")
+        return "Amazon account action completed."
+
     if tool_name == "amazon_search":
         return _format_amazon_tool_reply(tool_result)
     return ""
+
+
+def _looks_like_amazon_account_intent(message: str) -> bool:
+    text = message.lower()
+    keywords = [
+        "start amazon",
+        "amazon login",
+        "login amazon",
+        "my orders",
+        "order status",
+        "order history",
+        "amazon account",
+        "amazon orders",
+        "otp",
+        "amazon password",
+    ]
+    return any(keyword in text for keyword in keywords)
 
 
 def _extract_json_object(raw: str) -> dict[str, Any] | None:
@@ -241,7 +294,14 @@ def _safe_router_decision(message: str) -> dict[str, Any]:
     if not isinstance(params, dict):
         params = {}
 
+<<<<<<< HEAD
     # Fallback: ensure query params are populated from the raw user message when missing
+=======
+    if tool == "amazon_account" and not str(params.get("user_input", "")).strip():
+        params["user_input"] = message
+
+    # Fallback: if router picks amazon_search without query, use full user message.
+>>>>>>> 33c1271 (added amazon login and order details)
     if tool == "amazon_search" and not str(params.get("query", "")).strip():
         params["query"] = message
     if tool == "olx_search" and not str(params.get("query", "")).strip():
@@ -384,11 +444,58 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
 
             history = memory_service.get_history(sender)
 
-            decision = _safe_router_decision(message)
+            tool_name = ""
+            tool_result: dict[str, Any] | None = None
 
+            if sender in AMAZON_ACCOUNT_ACTIVE_SESSIONS:
+                tool_name = "amazon_account"
+                tool_result = await execute_tool(
+                    tool_name,
+                    {
+                        "session_id": sender,
+                        "user_input": message,
+                    },
+                )
+            else:
+                decision = _safe_router_decision(message)
+
+                if not decision.get("use_tool") and _looks_like_amazon_account_intent(message):
+                    decision = {
+                        "use_tool": True,
+                        "tool": "amazon_account",
+                        "params": {
+                            "session_id": sender,
+                            "user_input": message,
+                        },
+                        "reason": "explicit amazon account intent",
+                    }
+
+                if decision.get("use_tool") and decision.get("tool"):
+                    tool_name = str(decision["tool"])
+                    tool_params = decision.get("params", {})
+                    if not isinstance(tool_params, dict):
+                        tool_params = {}
+
+                    if tool_name == "amazon_account":
+                        tool_params.setdefault("session_id", sender)
+                        tool_params.setdefault("user_input", message)
+
+                    tool_result = await execute_tool(tool_name, tool_params)
+
+            if tool_name and tool_result is not None:
+                if tool_name == "amazon_account":
+                    if bool(tool_result.get("session_active", False)):
+                        AMAZON_ACCOUNT_ACTIVE_SESSIONS.add(sender)
+                    else:
+                        AMAZON_ACCOUNT_ACTIVE_SESSIONS.discard(sender)
+
+<<<<<<< HEAD
             if decision.get("use_tool") and decision.get("tool"):
                 tool_name = str(decision["tool"])
                 tool_params = decision.get("params", {})
+=======
+                reply = _build_tool_reply(tool_name, tool_result)
+>>>>>>> 33c1271 (added amazon login and order details)
 
                 if tool_name in _INLINE_TOOL_NAMES:
                     # Inline WS tools — run sub-handler directly on this connection
