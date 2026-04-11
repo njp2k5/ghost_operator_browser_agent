@@ -1,12 +1,30 @@
+import re
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
+
+def _build_asyncpg_url(raw: str) -> tuple[str, dict]:
+    """Strip Neon-specific query params and return (clean_url, connect_args)."""
+    # Remove sslmode and channel_binding from the URL — asyncpg uses connect_args instead
+    clean = re.sub(r'[?&]sslmode=[^&]*', '', raw)
+    clean = re.sub(r'[?&]channel_binding=[^&]*', '', clean)
+    # Repair URL if we stripped the only query param (leftover ? or &)
+    clean = re.sub(r'[?&]$', '', clean)
+    needs_ssl = 'sslmode=require' in raw or 'neon.tech' in raw
+    connect_args = {"ssl": "require"} if needs_ssl else {}
+    return clean, connect_args
+
+
+_db_url, _connect_args = _build_asyncpg_url(settings.DATABASE_URL)
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _db_url,
     echo=False,
     pool_pre_ping=True,
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
