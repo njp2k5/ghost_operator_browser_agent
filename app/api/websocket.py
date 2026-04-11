@@ -69,30 +69,25 @@ async def _load_steps(db: AsyncSession, token: str) -> list[dict]:
 
 def _remaining_steps_match_page(remaining: list[dict], page_fields: list[dict]) -> bool:
     """
-    Return True if the next non-click/wait step's selector is found among
-    visible page fields.  If the very next field-based step doesn't match,
-    the page has changed and we need a replan.
+    Return True if the next fill/select step's selector is found among
+    visible page fields.  Only judges by the FIRST fill/select step
+    (click/wait steps are never a mismatch signal).
     """
     page_labels = {f.get("label", "").lower().strip() for f in page_fields if f.get("label")}
-    # Also index by partial match: "First name" should match a label containing "first name"
     for step in remaining:
         action = step.get("action", "")
         selector = (step.get("selector") or "").lower().strip()
         if action in ("fill", "select") and selector:
-            # Check if any page label contains/matches this selector
+            # Require that the selector matches a label as a whole-word
+            # (not just substring — avoids 'submit' matching 'subjects').
             found = any(
-                selector in plbl or plbl in selector
+                selector == plbl                            # exact
+                or (len(selector) > 3 and plbl.startswith(selector))  # label starts with selector
+                or (len(plbl) > 3 and selector.startswith(plbl))     # selector starts with label
                 for plbl in page_labels
             )
-            return found  # judge by the FIRST field-based step
-        if action == "click" and selector:
-            # Buttons are trickier — check page buttons too
-            found = any(
-                selector in plbl or plbl in selector
-                for plbl in page_labels
-            )
-            return found
-    # Only wait/navigate steps remain — no mismatch
+            return found  # judge by the FIRST fill/select step only
+    # Only click/wait/navigate steps remain — not a mismatch
     return True
 
 
@@ -112,10 +107,19 @@ async def _do_replan(
     Call the LLM to generate new remaining steps, persist them to DB,
     and return the new steps as dicts (same format as _load_steps).
     """
+    # Only send EMPTY (unfilled) fields to the LLM — prevents it from
+    # regenerating steps for fields the user already completed.
+    empty_fields = [
+        f for f in page_fields
+        if not f.get("value")                       # text inputs with no value
+        or f.get("type") in ("click",)               # buttons are always shown
+    ]
+    logger.info(f"[WS:{token}] Replan: {len(page_fields)} visible fields, {len(empty_fields)} empty")
+
     new_raw_steps = await replan_remaining_steps(
         task=task,
         completed_steps=completed_steps,
-        visible_fields=page_fields,
+        visible_fields=empty_fields,
         page_url=page_url,
         next_step_number=next_step_num,
     )
@@ -151,6 +155,38 @@ async def _do_replan(
             }]
 
     logger.info(f"[WS:{token}] Final replan: {len(new_raw_steps)} steps")
+
+    # ---- Filter out steps that duplicate already-completed selectors ----
+    if completed_steps:
+        done_selectors = [
+            (s.get("selector") or "").lower().strip()
+            for s in completed_steps
+            if s.get("selector")
+        ]
+
+        def _already_done(step: dict) -> bool:
+            """Fuzzy check: is this step's selector already completed?"""
+            act = step.get("action", "")
+            if act in ("navigate", "wait"):
+                return False  # never filter these
+            sel = (step.get("selector") or "").lower().strip()
+            if not sel:
+                return False
+            for ds in done_selectors:
+                if not ds:
+                    continue
+                # Exact, or either contains the other (fuzzy)
+                if sel == ds or sel in ds or ds in sel:
+                    return True
+            return False
+
+        before_len = len(new_raw_steps)
+        new_raw_steps = [s for s in new_raw_steps if not _already_done(s)]
+        if len(new_raw_steps) < before_len:
+            logger.info(f"[WS:{token}] Filtered {before_len - len(new_raw_steps)} duplicate steps (already completed)")
+        # Renumber
+        for i, s in enumerate(new_raw_steps):
+            s["step_number"] = next_step_num + i
 
     # Persist to DB: delete old remaining, insert new
     new_step_dicts = []
@@ -506,10 +542,13 @@ async def websocket_session(websocket: WebSocket, token: str):
                 logger.warning(f"[WS:{token}] DB update after step {step_num} failed: {db_err}")
 
             # ----- After click: proactively check if remaining steps match the new page -----
-            # Only run if grace period is exhausted (prevents re-triggering right after a replan)
+            # Only run if (a) grace period is exhausted, (b) URL actually changed after click
             if needs_replan_check and replan_grace_remaining == 0:
                 post_click_url = browser_session.page.url
-                if post_click_url == last_replan_url:
+                # Skip if URL is the same (same-page interaction, e.g. radio/checkbox click)
+                if post_click_url == current_page_url:
+                    logger.info(f"[WS:{token}] Post-click: same page URL, no replan needed.")
+                elif post_click_url == last_replan_url:
                     logger.info(f"[WS:{token}] Post-click: same URL as last replan, skipping mismatch check.")
                 else:
                     remaining = [s for s in steps if not s["is_done"]]

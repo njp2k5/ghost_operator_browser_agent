@@ -126,7 +126,7 @@ async def replan_remaining_steps(
     """
     # Build a readable summary of what was already done
     done_summary = "\n".join(
-        f"  Step {s.get('step_number')}: [{s.get('action')}] {s.get('instruction')}"
+        f"  Step {s.get('step_number')}: [{s.get('action')}] selector=\"{s.get('selector', '')}\" — {s.get('instruction')}"
         for s in completed_steps
     )
     # Build a readable list of visible fields

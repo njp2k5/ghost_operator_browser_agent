@@ -500,6 +500,25 @@ async def scan_page_fields(session: BrowserSession) -> list[dict]:
                 else if (el.type === 'submit') fieldType = 'click';
                 else fieldType = 'fill';
 
+                // Determine current value (for detecting already-filled fields)
+                let fieldValue = '';
+                if (el.type === 'radio') {
+                    // For radio groups: check if ANY radio with same name is checked
+                    const gn = el.name;
+                    if (gn) {
+                        const chk = document.querySelector('input[name="' + gn + '"]:checked');
+                        fieldValue = chk ? chk.value : '';
+                    } else {
+                        fieldValue = el.checked ? 'checked' : '';
+                    }
+                } else if (el.type === 'checkbox') {
+                    fieldValue = el.checked ? 'checked' : '';
+                } else if (el.tagName === 'SELECT') {
+                    fieldValue = el.selectedIndex > 0 ? el.options[el.selectedIndex].text : '';
+                } else {
+                    fieldValue = (el.value || '').trim();
+                }
+
                 // Skip duplicates
                 const key = label + '|' + fieldType;
                 if (seen.has(key) || !label) continue;
@@ -511,7 +530,8 @@ async def scan_page_fields(session: BrowserSession) -> list[dict]:
                     tag: el.tagName.toLowerCase(),
                     inputType: el.type || '',
                     name: el.name || '',
-                    id: el.id || ''
+                    id: el.id || '',
+                    value: fieldValue
                 });
             }
             
