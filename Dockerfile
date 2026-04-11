@@ -34,9 +34,7 @@ RUN playwright install chromium
 # ── Application source ────────────────────────────────────────────────────────
 COPY . .
 
-# ── Port (Railway injects $PORT at runtime) ───────────────────────────────────
-EXPOSE 8000
-
-# ── Start: run DB migrations then launch the server ──────────────────────────
-# Shell form so ${PORT:-8000} expansion works
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# ── Start: run DB migrations then launch the server ─────────────────────────
+# Use ; (not &&) so uvicorn always starts even if alembic has nothing to do.
+# Railway injects $PORT; default to 8000 for local runs.
+CMD ["sh", "-c", "echo 'Starting on port '${PORT:-8000} && alembic upgrade head; echo 'Alembic done, starting uvicorn' && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
