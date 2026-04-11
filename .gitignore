@@ -1,0 +1,23 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Alembic
+alembic/versions/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+test-results/
+playwright-report/
