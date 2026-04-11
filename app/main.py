@@ -9,9 +9,14 @@ if sys.platform == "win32":
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+<<<<<<< HEAD
 from api.hindu_ws import router as hindu_ws_router
+=======
+from api.irctc_ws import router as irctc_ws_router
+>>>>>>> b2573b2 (added irctc_search to tool registry)
 from api.linkedin_ws import router as linkedin_ws_router  # file retained; now serves /ws/olx
 from api.ws import router as ws_router
+from tool_registry import load_builtin_tools
 from tool_registry.executor import execute_tool
 
 
@@ -19,9 +24,16 @@ class ToolExecutionRequest(BaseModel):
     tool: str = Field(..., description="Registered tool name")
     params: dict = Field(default_factory=dict, description="Tool input parameters")
 
+
+load_builtin_tools()
+
 app = FastAPI()
 
+<<<<<<< HEAD
 app.include_router(hindu_ws_router)
+=======
+app.include_router(irctc_ws_router)  # specific routes first — must precede wildcard /ws/{sender}
+>>>>>>> b2573b2 (added irctc_search to tool registry)
 app.include_router(linkedin_ws_router)  # specific routes first — must precede wildcard /ws/{sender}
 app.include_router(ws_router)
 
