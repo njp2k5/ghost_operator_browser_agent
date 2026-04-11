@@ -350,10 +350,17 @@ async def websocket_session(websocket: WebSocket, token: str):
 
             logger.info(f"[WS:{token}] === Step {step_num}/{total_steps}: action={action}, selector={selector}, url={url}")
 
+            # Detect Booking.com specialist selectors (booking:destination, etc.)
+            is_booking_step = (selector or "").startswith("booking:")
+            booking_key = selector.split(":", 1)[1] if is_booking_step else ""
+
             # ----- Check if the field actually exists on the current page -----
             field_found = True
             current_page_url = browser_session.page.url
-            if replan_grace_remaining > 0:
+            if is_booking_step:
+                # Booking.com steps use exact data-testid selectors — skip element_exists
+                field_found = True
+            elif replan_grace_remaining > 0:
                 # Still inside a replan grace window — trust the new steps, no element_exists check
                 logger.info(f"[WS:{token}] Grace period active ({replan_grace_remaining} left) — skipping element_exists for '{selector}'")
             elif selector and action in ("fill", "select", "click"):
@@ -423,10 +430,24 @@ async def websocket_session(websocket: WebSocket, token: str):
             # ----- Execute the step action (each wrapped individually) -----
             try:
                 if action == "navigate" and url:
-                    await websocket.send_json({"type": "status", "message": f"Opening {url}..."})
-                    result = await bm.navigate_to(browser_session, url)
-                    logger.info(f"[WS:{token}] navigate result: {result}")
-                    await bm.wait_for_page_stable(browser_session)
+                    # Skip redundant navigation if already on the target URL
+                    current_url = browser_session.page.url
+                    if url.rstrip("/") in current_url or current_url.startswith(url.rstrip("/")):
+                        logger.info(f"[WS:{token}] Already on {url}, skipping redundant navigate")
+                    else:
+                        await websocket.send_json({"type": "status", "message": f"Opening {url}..."})
+                        result = await bm.navigate_to(browser_session, url)
+                        logger.info(f"[WS:{token}] navigate result: {result}")
+                        await bm.wait_for_page_stable(browser_session)
+                    # Dismiss Booking.com overlays (sign-in banner, cookies) after page load
+                    if bm.is_booking_com(url) or bm.is_booking_com(current_url):
+                        await bm.booking_dismiss_overlays(browser_session)
+                        logger.info(f"[WS:{token}] Dismissed Booking.com overlays after navigate")
+
+                elif is_booking_step and selector:
+                    # Booking.com step: highlight via data-testid
+                    await bm.booking_highlight_step(browser_session, booking_key)
+                    logger.info(f"[WS:{token}] Booking: highlighted '{booking_key}'")
 
                 elif action in ("fill", "select", "click", "highlight") and selector:
                     # Only highlight during presentation — actual fill/select/click
@@ -502,7 +523,22 @@ async def websocket_session(websocket: WebSocket, token: str):
             # ----- After user presses Done: execute the real action -----
             needs_replan_check = False
             try:
-                if action == "fill" and selector:
+                if is_booking_step and selector:
+                    # Booking.com specialist execution
+                    value_to_use = user_value or prefill or ""
+                    ok = await bm.booking_execute_step(browser_session, booking_key, value_to_use)
+                    logger.info(f"[WS:{token}] Booking execute '{booking_key}' => {ok}")
+                    # Extra wait for search results page to fully load
+                    if booking_key == "search":
+                        await asyncio.sleep(3.0)
+                    else:
+                        await asyncio.sleep(0.5)
+                    screenshot = await bm.take_screenshot(browser_session)
+                    if screenshot:
+                        await websocket.send_json({"type": "frame", "screenshot": screenshot})
+                    needs_replan_check = False  # never replan booking steps
+
+                elif action == "fill" and selector:
                     value_to_type = user_value or prefill or ""
                     if value_to_type:
                         await bm.prefill_input(browser_session, selector, value_to_type)
@@ -554,7 +590,8 @@ async def websocket_session(websocket: WebSocket, token: str):
 
             # ----- After click: proactively check if remaining steps match the new page -----
             # Only run if (a) grace period is exhausted, (b) URL actually changed after click
-            if needs_replan_check and replan_grace_remaining == 0:
+            # Booking.com steps never trigger replan — they're hardcoded.
+            if needs_replan_check and replan_grace_remaining == 0 and not is_booking_step:
                 post_click_url = browser_session.page.url
                 # Skip if URL is the same (same-page interaction, e.g. radio/checkbox click)
                 if post_click_url == current_page_url:

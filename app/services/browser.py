@@ -672,10 +672,15 @@ async def _resolve_locator(session: BrowserSession, resolved):
 async def take_screenshot(session: BrowserSession) -> str:
     """Take a screenshot and return it as a base64-encoded JPEG string (faster, smaller than PNG)."""
     try:
+        if session.page.is_closed():
+            return ""
         jpg_bytes = await session.page.screenshot(type="jpeg", quality=70, full_page=False)
         return base64.b64encode(jpg_bytes).decode("utf-8")
     except Exception as e:
-        logger.warning(f"[{session.token}] Screenshot failed: {e}")
+        # Suppress noisy "page closed" warnings during concurrent operations
+        err_msg = str(e)
+        if "closed" not in err_msg.lower():
+            logger.warning(f"[{session.token}] Screenshot failed: {e}")
         return ""
 
 
@@ -984,4 +989,314 @@ async def navigate_to(session: BrowserSession, url: str) -> bool:
         return True
     except Exception as e:
         logger.warning(f"[{session.token}] navigate_to failed for '{url}': {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Booking.com — specialized flow handlers
+# ---------------------------------------------------------------------------
+
+def is_booking_com(url: str) -> bool:
+    """Check if the URL is a Booking.com page."""
+    return "booking.com" in (url or "").lower()
+
+
+@_on_pw_loop
+async def booking_dismiss_overlays(session: BrowserSession) -> None:
+    """Close the 'Sign in' banner, cookie consent, and any modal that
+    intercepts pointer events on Booking.com.
+    Uses CSS visibility:hidden + pointer-events:none rather than DOM removal
+    to avoid triggering Booking.com's mutation observers / reload logic."""
+    page = session.page
+    try:
+        # Hide overlays via CSS (safer than removing — avoids mutation observer triggers)
+        await page.evaluate("""() => {
+            // Hide login/sign-in overlay & backdrop
+            document.querySelectorAll(
+                '[role="dialog"], [aria-modal="true"], div.dc7e768484, div.bbe73dce14'
+            ).forEach(el => {
+                el.style.cssText = 'display:none !important; visibility:hidden !important; pointer-events:none !important;';
+            });
+            // Also hide any fixed-position overlays at top of z-stack
+            document.querySelectorAll('[class*="genius"], [class*="signin"], [class*="login-banner"]').forEach(el => {
+                el.style.cssText = 'display:none !important;';
+            });
+        }""")
+        logger.info(f"[{session.token}] booking: hid overlays via CSS")
+    except Exception:
+        pass
+
+    # Also try clicking common close / dismiss / accept buttons
+    for sel in [
+        'button[aria-label="Dismiss sign-in info."]',
+        'button[aria-label="Dismiss sign in information."]',
+        '#onetrust-accept-btn-handler',   # cookie consent
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                await loc.click(timeout=2000, force=True)
+                await page.wait_for_timeout(300)
+                logger.info(f"[{session.token}] booking: clicked dismiss: {sel}")
+        except Exception:
+            pass
+
+
+@_on_pw_loop
+async def booking_highlight_step(session: BrowserSession, step_selector: str) -> bool:
+    """Highlight a Booking.com search form element using data-testid selectors."""
+    page = session.page
+
+    SELECTOR_MAP = {
+        "destination":  'input[name="ss"]',
+        "dates":        '[data-testid="searchbox-dates-container"]',
+        "check-in":     '[data-testid="date-display-field-start"]',
+        "check-out":    '[data-testid="date-display-field-end"]',
+        "guests":       '[data-testid="occupancy-config"]',
+        "search":       'button[type="submit"]',
+        "results":      'body',  # full-page highlight for results
+    }
+
+    css = SELECTOR_MAP.get(step_selector.lower())
+    if not css:
+        logger.warning(f"[{session.token}] booking_highlight: unknown selector '{step_selector}'")
+        return False
+
+    try:
+        el = page.locator(css).first
+        bbox = await el.bounding_box()
+        if bbox:
+            await el.scroll_into_view_if_needed(timeout=3000)
+            await page.evaluate("""(b) => {
+                document.querySelectorAll('.__fl_hl').forEach(e => e.remove());
+                const d = document.createElement('div');
+                d.className = '__fl_hl';
+                d.style.cssText = `position:fixed;left:${b.x-4}px;top:${b.y-4}px;width:${b.width+8}px;height:${b.height+8}px;border:3px solid #22d3ee;box-shadow:0 0 0 4px rgba(34,211,238,0.35),0 0 15px rgba(34,211,238,0.3);border-radius:6px;pointer-events:none;z-index:99999;transition:all 0.2s;`;
+                document.body.appendChild(d);
+            }""", bbox)
+            logger.info(f"[{session.token}] booking: highlighted '{step_selector}' via {css}")
+            return True
+    except Exception as e:
+        logger.warning(f"[{session.token}] booking_highlight failed: {e}")
+    return False
+
+
+@_on_pw_loop
+async def booking_execute_step(session: BrowserSession, step_selector: str, value: str) -> bool:
+    """Execute a Booking.com search step using exact data-testid selectors.
+
+    Uses JS clicks and force=True to bypass modal overlays that Booking.com
+    shows for sign-in prompts and cookie consent.
+    """
+    page = session.page
+    sel = step_selector.lower().strip()
+    logger.info(f"[{session.token}] booking_execute: sel={sel}, value={value}")
+
+    try:
+        # ── DESTINATION ────────────────────────────────────────────
+        if sel == "destination":
+            # Focus destination with JS click to bypass any overlay
+            await page.evaluate("""() => {
+                const inp = document.querySelector('input[name="ss"]');
+                if (inp) { inp.focus(); inp.click(); }
+            }""")
+            await page.wait_for_timeout(400)
+            # Clear existing text
+            inp = page.locator('input[name="ss"]')
+            await inp.fill("", timeout=3000)
+            await page.wait_for_timeout(200)
+            # Type destination letter by letter for autocomplete
+            await inp.type(value, delay=90)
+            await page.wait_for_timeout(2000)  # wait for autocomplete dropdown
+
+            # Try to click first autocomplete suggestion with multiple strategies
+            picked = False
+            for ac_sel in [
+                '[data-testid="autocomplete-result"]',
+                'ul[role="listbox"] li',
+                '[role="option"]',
+            ]:
+                try:
+                    first_opt = page.locator(ac_sel).first
+                    if await first_opt.count() > 0:
+                        await first_opt.click(timeout=3000, force=True)
+                        logger.info(f"[{session.token}] booking: picked autocomplete via {ac_sel}")
+                        picked = True
+                        break
+                except Exception:
+                    continue
+
+            if not picked:
+                # Fallback: press Down+Enter to accept first suggestion
+                await page.keyboard.press("ArrowDown")
+                await page.wait_for_timeout(200)
+                await page.keyboard.press("Enter")
+                logger.info(f"[{session.token}] booking: autocomplete fallback Enter")
+
+            await page.wait_for_timeout(600)
+            return True
+
+        # ── DATES (calendar picker) ────────────────────────────────
+        elif sel == "dates":
+            # Open calendar via JS click to bypass overlays
+            await page.evaluate("""() => {
+                const btn = document.querySelector('[data-testid="searchbox-dates-container"]');
+                if (btn) btn.click();
+            }""")
+            await page.wait_for_timeout(1200)
+
+            # Parse "2026-05-10 to 2026-05-15"
+            parts = value.replace(" to ", "|").replace(" - ", "|").replace(",", "|").split("|")
+            checkin = parts[0].strip() if len(parts) >= 1 else ""
+            checkout = parts[1].strip() if len(parts) >= 2 else ""
+
+            async def _navigate_and_click_date(date_str: str, label: str):
+                """Scroll the calendar forward month by month until the
+                [data-date] cell is visible, then click it."""
+                for attempt in range(14):  # up to ~14 months ahead
+                    # Check if the date cell exists in the current view
+                    found = await page.evaluate(f"""() => {{
+                        const c = document.querySelector('[data-date="{date_str}"]');
+                        if (!c) return false;
+                        const r = c.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0 && r.top > 0 && r.top < window.innerHeight;
+                    }}""")
+                    if found:
+                        # Click via JS — guaranteed no overlay intercept
+                        await page.evaluate(f"""() => {{
+                            document.querySelector('[data-date="{date_str}"]').click();
+                        }}""")
+                        logger.info(f"[{session.token}] booking: clicked {label} {date_str} (attempt {attempt})")
+                        await page.wait_for_timeout(500)
+                        return True
+
+                    # Click the '>' next-month button (aria-label="Next month")
+                    clicked_next = await page.evaluate("""() => {
+                        const btn = document.querySelector('button[aria-label="Next month"]');
+                        if (btn) { btn.click(); return true; }
+                        return false;
+                    }""")
+                    if not clicked_next:
+                        logger.warning(f"[{session.token}] booking: no 'Next month' button found")
+                        break
+                    await page.wait_for_timeout(500)
+
+                logger.warning(f"[{session.token}] booking: could not find {label} {date_str} after scrolling")
+                return False
+
+            if checkin:
+                await _navigate_and_click_date(checkin, "check-in")
+            if checkout:
+                await _navigate_and_click_date(checkout, "check-out")
+
+            return True
+
+        # ── GUESTS (occupancy +/- popup) ───────────────────────────
+        elif sel == "guests":
+            # Open occupancy popup via JS to bypass overlays
+            await page.evaluate("""() => {
+                const btn = document.querySelector('[data-testid="occupancy-config"]');
+                if (btn) btn.click();
+            }""")
+            await page.wait_for_timeout(800)
+
+            # Parse value — formats: "2", "2 adults", "2 adults 1 child",
+            # "adults=3,children=1,rooms=1"
+            import re as _re
+            target_adults = 2
+            target_children = 0
+            target_rooms = 1
+
+            m_a = _re.search(r'(\d+)\s*adult', value.lower())
+            if m_a:
+                target_adults = int(m_a.group(1))
+            elif value.strip().isdigit():
+                target_adults = int(value.strip())
+
+            m_c = _re.search(r'(\d+)\s*child', value.lower())
+            if m_c:
+                target_children = int(m_c.group(1))
+
+            m_r = _re.search(r'(\d+)\s*room', value.lower())
+            if m_r:
+                target_rooms = int(m_r.group(1))
+
+            async def _adjust_field(input_id: str, target: int, field_name: str):
+                """Use JS to read the current value from the hidden input,
+                then click its sibling minus (btn[0]) / plus (btn[1]) buttons."""
+                result = await page.evaluate(f"""(target) => {{
+                    const inp = document.getElementById('{input_id}');
+                    if (!inp) return {{ok:false, err:'input not found'}};
+                    const current = parseInt(inp.value) || 0;
+                    // Find the two sibling buttons (minus, plus) in the same row
+                    const row = inp.parentElement;
+                    const btns = row ? row.querySelectorAll('button') : [];
+                    if (btns.length < 2) return {{ok:false, err:'buttons not found', btnCount:btns.length}};
+                    const minus = btns[0];
+                    const plus  = btns[1];
+                    let diff = target - current;
+                    let clicks = 0;
+                    while (diff > 0) {{ plus.click();  diff--; clicks++; }}
+                    while (diff < 0) {{ minus.click(); diff++; clicks++; }}
+                    // Re-read to confirm
+                    const final_val = parseInt(inp.value) || 0;
+                    return {{ok:true, from:current, to:final_val, clicks:clicks}};
+                }}""", target)
+                logger.info(f"[{session.token}] booking: {field_name} adjust: {result}")
+                await page.wait_for_timeout(250)
+
+            await _adjust_field('group_adults',   target_adults,   'adults')
+            await _adjust_field('group_children', target_children, 'children')
+            await _adjust_field('no_rooms',       target_rooms,    'rooms')
+
+            # Close popup by clicking Done button
+            try:
+                await page.evaluate("""() => {
+                    const popup = document.querySelector('[data-testid="occupancy-popup"]');
+                    if (!popup) return;
+                    const btns = popup.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.trim() === 'Done') { b.click(); return; }
+                    }
+                }""")
+                await page.wait_for_timeout(400)
+                logger.info(f"[{session.token}] booking: closed occupancy popup")
+            except Exception:
+                pass
+
+            return True
+
+        # ── SEARCH (submit) ────────────────────────────────────────
+        elif sel == "search":
+            # Click the search/submit button via JS to bypass overlays
+            await page.evaluate("""() => {
+                const btn = document.querySelector('button[type="submit"]');
+                if (btn) btn.click();
+            }""")
+            # Wait for the results page to load
+            try:
+                await page.wait_for_load_state('domcontentloaded', timeout=15000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(4000)
+            logger.info(f"[{session.token}] booking: clicked Search, results loading")
+            return True
+
+        # ── RESULTS (view search results page) ─────────────────────
+        elif sel == "results":
+            # Just wait for the results page to fully render
+            try:
+                await page.wait_for_load_state('networkidle', timeout=10000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2000)
+            logger.info(f"[{session.token}] booking: results page displayed")
+            return True
+
+        else:
+            logger.warning(f"[{session.token}] booking_execute: unknown step '{sel}'")
+            return False
+
+    except Exception as e:
+        logger.warning(f"[{session.token}] booking_execute failed for '{sel}': {e}")
         return False

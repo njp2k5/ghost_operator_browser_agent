@@ -86,6 +86,24 @@ DEMO_SAUCE = {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DEMO 5 — Booking.com Hotel Search  ★ HACKATHON HERO DEMO
+# Uses hardcoded booking:* selectors — bypasses LLM entirely for reliability.
+# Shows: NAVIGATE → FILL (destination) → FILL (dates) → FILL (guests) → CLICK (search)
+# ──────────────────────────────────────────────────────────────────────────────
+DEMO_BOOKING = {
+    "user_id": "demo-user",
+    "task": (
+        "Search for hotels in Goa on Booking.com. "
+        "Enter 'Goa' as the destination. "
+        "Set check-in date to '2026-05-10' and check-out date to '2026-05-15'. "
+        "Set guests to 2 adults. "
+        "Click the Search button."
+    ),
+    "context": "Customer is looking for a 5-night hotel stay in Goa for 2 adults.",
+    "target_url": "https://www.booking.com",
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Choose which demo to generate
 # ──────────────────────────────────────────────────────────────────────────────
 DEMOS = {
@@ -93,11 +111,12 @@ DEMOS = {
     "2": ("Wikipedia Search",     DEMO_WIKI),
     "3": ("Books to Scrape",      DEMO_BOOKS),
     "4": ("SauceDemo E-Commerce", DEMO_SAUCE),
+    "5": ("Booking.com Search",   DEMO_BOOKING),
 }
 
 choice = sys.argv[1] if len(sys.argv) > 1 else "1"
 if choice not in DEMOS:
-    print("Usage: python demo_gen.py [1|2|3|4]")
+    print("Usage: python demo_gen.py [1|2|3|4|5]")
     for k, (name, _) in DEMOS.items():
         print(f"  {k} - {name}")
     sys.exit(1)
