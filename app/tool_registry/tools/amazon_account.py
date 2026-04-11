@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import concurrent.futures
 import json
 import os
 import re
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +61,40 @@ CONTINUE_SIGNALS = {
     "next",
     "ok done",
 }
+
+# ---------------------------------------------------------------------------
+# Persistent ProactorEventLoop worker
+# ---------------------------------------------------------------------------
+# amazon_account creates stateful Playwright objects (browser/page) that are
+# bound to the event loop they were created in.  Uvicorn on Windows runs a
+# SelectorEventLoop which cannot spawn subprocesses, so we keep a single
+# dedicated ProactorEventLoop running in a background daemon thread.  Every
+# call to `run()` is dispatched to that loop via run_coroutine_threadsafe so
+# all sessions share the same loop and Playwright objects stay valid across
+# multiple turns.
+
+_WORKER_LOOP: asyncio.AbstractEventLoop | None = None
+_WORKER_THREAD: threading.Thread | None = None
+_WORKER_LOCK = threading.Lock()
+
+
+def _get_worker_loop() -> asyncio.AbstractEventLoop:
+    global _WORKER_LOOP, _WORKER_THREAD
+    with _WORKER_LOCK:
+        if _WORKER_LOOP is not None and not _WORKER_LOOP.is_closed():
+            return _WORKER_LOOP
+        if sys.platform == "win32":
+            new_loop: asyncio.AbstractEventLoop = asyncio.ProactorEventLoop()
+        else:
+            new_loop = asyncio.new_event_loop()
+        _WORKER_LOOP = new_loop
+        _WORKER_THREAD = threading.Thread(
+            target=new_loop.run_forever,
+            daemon=True,
+            name="amazon-account-worker",
+        )
+        _WORKER_THREAD.start()
+        return new_loop
 
 
 tool_definition = {
@@ -883,7 +921,7 @@ async def _handle_authenticated(
     )
 
 
-async def run(params: dict[str, Any]) -> dict[str, Any]:
+async def _run_impl(params: dict[str, Any]) -> dict[str, Any]:
     session_id = str(params.get("session_id") or "").strip()
     if not session_id:
         return _result(
@@ -1038,6 +1076,15 @@ async def run(params: dict[str, Any]) -> dict[str, Any]:
         assistant_reply="Amazon session is in an unknown state. Please restart login.",
         stage=session.stage,
         session_active=True,
+    )
+
+
+async def run(params: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch _run_impl to the persistent ProactorEventLoop worker thread."""
+    worker_loop = _get_worker_loop()
+    future = asyncio.run_coroutine_threadsafe(_run_impl(params), worker_loop)
+    return await asyncio.get_running_loop().run_in_executor(
+        None, future.result
     )
 
 

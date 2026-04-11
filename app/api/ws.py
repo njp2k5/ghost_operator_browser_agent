@@ -64,6 +64,29 @@ _INLINE_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "housing_search",
+        "description": "Find property listings on MagicBricks for rent or buy in Indian cities.",
+        "input_schema": {
+            "properties": {
+                "city": {"type": "string", "description": "City name (e.g. Bengaluru, Mumbai, Delhi)"},
+                "query": {"type": "string", "description": "Keywords like locality, 2BHK, furnished", "default": ""},
+                "purpose": {"type": "string", "description": "rent or buy", "default": "rent"},
+                "limit": {"type": "integer", "description": "Number of listings (1-25)", "default": 5},
+            },
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "amazon_account",
+        "description": "Login to Amazon and fetch order history or track a specific order.",
+        "input_schema": {
+            "properties": {
+                "user_input": {"type": "string", "description": "User's message for the current login/order step"},
+                "command": {"type": "string", "description": "Optional: start, orders, order_status, logout"},
+            },
+        },
+    },
 ]
 
 _INLINE_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in _INLINE_TOOLS)
@@ -97,6 +120,10 @@ Rules:
   Set params.query to the full user query (preserve station names and dates).
 - Use `hindu_news` for news queries, current events, headlines, sports, business, technology news.
   Set params.section to the best matching section from the available list. Optionally set params.limit.
+- Use `housing_search` for property listings, apartments, flats, rent/buy queries, real estate in Indian cities.
+  Set params.city to the target city. Set params.purpose to rent or buy. Set params.query for extra keywords.
+- Use `amazon_account` when the user wants to login to Amazon, check order history, or track an order.
+  Set params.user_input to the user's message. Set params.command to 'start' on first intent.
 - If no tool is needed (general chat, greetings, opinions, calculations), return use_tool=false and tool="".
 """
 
@@ -369,6 +396,58 @@ def _format_hindu_reply(results: list[dict[str, Any]], section: str) -> str:
     return f"Latest The Hindu news ({section}):\n\n" + "\n\n".join(lines)
 
 
+def _format_housing_reply(result: dict[str, Any]) -> str:
+    if not result.get("success"):
+        error = str(result.get("error") or "Could not fetch property listings.")
+        city = str(result.get("city") or "").strip()
+        hint = f" Try browsing https://www.magicbricks.com directly for {city}." if city else ""
+        return f"No listings found: {error}.{hint}"
+
+    listings = result.get("results") or []
+    if not listings:
+        return "No MagicBricks listings found for your search. Try adjusting the city or keywords."
+
+    city = str(result.get("city") or "your city").strip()
+    purpose = str(result.get("purpose") or "rent").strip()
+    lines: list[str] = []
+    for i, item in enumerate(listings, 1):
+        title = str(item.get("title") or "Listing").strip()
+        price = str(item.get("price") or "").strip()
+        bhk = str(item.get("bhk") or "").strip()
+        location = str(item.get("location") or "").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        meta = " | ".join(v for v in [bhk, price, location] if v) or "details on site"
+        line = f"{i}. *{title}*\n   {meta}"
+        if snippet:
+            line += f"\n   {snippet[:100]}{'...' if len(snippet) > 100 else ''}"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    return f"🏠 Found {len(lines)} property listing(s) to {purpose} in {city}:\n\n" + "\n\n".join(lines)
+
+
+def _format_amazon_account_reply(result: dict[str, Any]) -> str:
+    reply = str(result.get("assistant_reply") or "").strip()
+    orders = result.get("orders")
+    if not isinstance(orders, list) or not orders:
+        return reply or "Amazon agent responded but had no message."
+
+    order_lines: list[str] = []
+    for i, order in enumerate(orders, 1):
+        oid = str(order.get("order_id") or "").strip()
+        title = str(order.get("title") or "Item").strip()
+        status = str(order.get("status") or "Status unavailable").strip()
+        url = str(order.get("detail_url") or "").strip()
+        line = f"{i}. #{oid} — *{title}*\n   Status: {status}"
+        if url:
+            line += f"\n   {url}"
+        order_lines.append(line)
+
+    orders_text = "\n\n".join(order_lines)
+    return (reply + "\n\n" + orders_text).strip()
+
+
 # ---------------------------------------------------------------------------
 # Inline tool dispatcher — runs sub-handler on the same websocket connection
 # ---------------------------------------------------------------------------
@@ -428,6 +507,37 @@ async def _dispatch_inline_tool(
             await manager.send(sender, "⚠️ Feed returned empty, The Hindu may be temporarily unavailable.")
         return _format_hindu_reply(results, section)
 
+    if tool_name == "housing_search":
+        city = str(params.get("city") or "").strip()
+        if not city:
+            return "I need a city name to search for property listings. For example: *find 2BHK rent in Bengaluru*."
+        query = str(params.get("query") or "").strip()
+        purpose = str(params.get("purpose") or "rent").strip().lower()
+        limit = max(1, min(int(params.get("limit") or 5), 25))
+        display_q = f"{query} {purpose} in {city}".strip()
+        await manager.send(sender, f"🏠 Searching MagicBricks for *{display_q}*...")
+        await manager.send(sender, "📡 Opening MagicBricks property listings page...")
+        await manager.send(sender, "🔍 Scanning property cards and extracting prices...")
+        result = await execute_tool("housing_listings", {"city": city, "query": query, "purpose": purpose, "limit": limit})
+        count = result.get("count") or len(result.get("results") or [])
+        if result.get("success") and count:
+            await manager.send(sender, f"✅ Found {count} listing(s)! Putting them together...")
+        else:
+            await manager.send(sender, "⚠️ Live scrape returned nothing, loading fallback catalog...")
+        return _format_housing_reply(result)
+
+    if tool_name == "amazon_account":
+        AMAZON_ACCOUNT_ACTIVE_SESSIONS.add(sender)
+        await manager.send(sender, "🛒 Starting Amazon account agent...")
+        await manager.send(sender, "🌐 Opening headless browser and navigating to Amazon login...")
+        result = await execute_tool(
+            "amazon_account",
+            {"session_id": sender, "user_input": original_message, "command": params.get("command", "")},
+        )
+        if not result.get("session_active", True):
+            AMAZON_ACCOUNT_ACTIVE_SESSIONS.discard(sender)
+        return _format_amazon_account_reply(result)
+
     return ""
 
 
@@ -456,6 +566,7 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
 
             if sender in AMAZON_ACCOUNT_ACTIVE_SESSIONS:
                 tool_name = "amazon_account"
+                await manager.send(sender, "🛒 Passing your message to Amazon account agent...")
                 tool_result = await execute_tool(
                     tool_name,
                     {
@@ -463,7 +574,9 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
                         "user_input": message,
                     },
                 )
-                reply = _build_tool_reply(tool_name, tool_result) or str(tool_result)
+                reply = _format_amazon_account_reply(tool_result)
+                if not tool_result.get("session_active", True):
+                    AMAZON_ACCOUNT_ACTIVE_SESSIONS.discard(sender)
             else:
                 decision = _safe_router_decision(message)
 
