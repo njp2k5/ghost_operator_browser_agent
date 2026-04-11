@@ -6,6 +6,13 @@ from tool_registry.registry import get_tool
 from tool_registry import tools as _tools  # noqa: F401
 
 
+def _format_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return f"{type(exc).__name__}: unspecified error"
+
+
 async def execute_tool(name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     tool = get_tool(name)
     if tool is None:
@@ -24,7 +31,7 @@ async def execute_tool(name: str, params: dict[str, Any] | None = None) -> dict[
             "success": False,
             "tool": name,
             "params": safe_params,
-            "error": str(exc),
+            "error": _format_error(exc),
         }
 
     if not isinstance(result, dict):
