@@ -12,13 +12,13 @@ class LLMService:
             self.client = Groq(api_key=GROQ_API_KEY)
         return self.client
 
-    def generate(self, messages):
+    def generate(self, messages, temperature: float = 0.7, max_tokens: int = 300):
         client = self._ensure_client()
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            temperature=0.7,
-            max_tokens=300
+            temperature=temperature,
+            max_tokens=max_tokens
         )
         return completion.choices[0].message.content or ""
 

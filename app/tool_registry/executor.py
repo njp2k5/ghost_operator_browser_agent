@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from tool_registry.registry import get_tool
+from tool_registry import tools as _tools  # noqa: F401
 
 
 async def execute_tool(name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
