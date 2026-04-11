@@ -122,8 +122,8 @@ Rules:
   Set params.section to the best matching section from the available list. Optionally set params.limit.
 - Use `housing_search` for property listings, apartments, flats, rent/buy queries, real estate in Indian cities.
   Set params.city to the target city. Set params.purpose to rent or buy. Set params.query for extra keywords.
-- Use `amazon_account` when the user wants to login to Amazon, check order history, or track an order.
-  Set params.user_input to the user's message. Set params.command to 'start' on first intent.
+- Use `practo_doctors` for doctor search, clinic search, specialist discovery, consultation fee checks.
+    Set params.city to the city name. You may set params.speciality, params.locality, and params.limit.
 - If no tool is needed (general chat, greetings, opinions, calculations), return use_tool=false and tool="".
 """
 
