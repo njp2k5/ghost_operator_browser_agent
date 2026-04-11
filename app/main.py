@@ -1,9 +1,12 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.templating import Jinja2Templates
 
 from app.core.database import create_tables
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -23,9 +26,11 @@ app = FastAPI(
 
 templates = Jinja2Templates(directory="app/templates")
 
-# Routers will be registered here in later steps
-# from app.api import generate, guide, websocket
-# app.include_router(generate.router)
+from app.api import generate
+app.include_router(generate.router)
+
+# Routers added in later steps:
+# from app.api import guide, websocket
 # app.include_router(guide.router)
 # app.include_router(websocket.router)
 

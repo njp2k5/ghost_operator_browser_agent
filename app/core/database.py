@@ -27,6 +27,15 @@ async def get_db() -> AsyncSession:
 
 async def create_tables():
     """Create all tables on startup (used only in dev; use Alembic in prod)."""
-    async with engine.begin() as conn:
-        from app.models import session as _  # noqa: ensure models are imported
-        await conn.run_sync(Base.metadata.create_all)
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        async with engine.begin() as conn:
+            from app.models import session as _  # noqa: ensure models are imported
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables verified/created.")
+    except Exception as e:
+        logger.warning(
+            f"Could not connect to database on startup: {e}\n"
+            "Set a valid DATABASE_URL in .env to enable DB features."
+        )
