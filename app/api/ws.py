@@ -12,7 +12,7 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
     try:
         while True:
             data = await websocket.receive_json()
-            message = data["message"]
+            message = data.get("message") or data.get("data", "")
 
             # store user msg
             memory_service.append(sender, "user", message)
