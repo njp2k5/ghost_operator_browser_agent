@@ -41,7 +41,7 @@ class Session(Base):
 
     token: Mapped[str] = mapped_column(String(32), primary_key=True, index=True)
     user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
-    task: Mapped[str] = mapped_column(String(256), nullable=False)
+    task: Mapped[str] = mapped_column(Text, nullable=False)
     target_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     context: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[SessionStatus] = mapped_column(

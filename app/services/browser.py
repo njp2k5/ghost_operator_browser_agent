@@ -253,25 +253,44 @@ async def _find_element(session: BrowserSession, selector: str):
     except Exception:
         pass
 
-    # 3. Try finding a label element containing the text, then get associated input
+    # 3. Try by placeholder text (more precise than label scan for multi-input rows)
+    try:
+        locator = page.get_by_placeholder(selector, exact=False)
+        if await locator.count() > 0 and await locator.first.is_visible():
+            logger.info(f"[{session.token}] get_by_placeholder('{selector}') matched")
+            return ("placeholder", selector)
+    except Exception:
+        pass
+
+    # 4. Try finding a label element containing the text, then get associated input
     try:
         found = await page.evaluate("""(labelText) => {
+            const lt = labelText.toLowerCase();
             const labels = document.querySelectorAll('label');
             for (const lbl of labels) {
                 const text = lbl.textContent.replace(/[\\s*]+/g, ' ').trim().toLowerCase();
-                if (text.includes(labelText.toLowerCase())) {
-                    // If label has 'for' attribute, return the target ID
-                    if (lbl.htmlFor) {
-                        const target = document.getElementById(lbl.htmlFor);
-                        if (target) return '#' + lbl.htmlFor;
-                    }
-                    // Otherwise look for input/select/textarea inside or next to the label
-                    const parent = lbl.closest('.form-group, .field, div, td, tr') || lbl.parentElement;
-                    if (parent) {
-                        const input = parent.querySelector('input:not([type="hidden"]), select, textarea');
-                        if (input && input.id) return '#' + input.id;
-                        if (input && input.name) return '[name="' + input.name + '"]';
-                    }
+                if (!text.includes(lt) && !lt.includes(text)) continue;
+
+                // If label has 'for' attribute, return the target ID
+                if (lbl.htmlFor) {
+                    const target = document.getElementById(lbl.htmlFor);
+                    if (target) return '#' + lbl.htmlFor;
+                }
+
+                // Walk UP to a row-level container, then search ALL descendants.
+                // Many forms put label in one column-div and input in a sibling column-div.
+                const rowSelectors = '.row, .form-group, .form-row, [class*="row"], [class*="form-group"], form, fieldset';
+                let container = lbl.closest(rowSelectors);
+                if (!container) {
+                    // Fallback: walk up 3 levels
+                    container = lbl.parentElement;
+                    if (container) container = container.parentElement || container;
+                    if (container) container = container.parentElement || container;
+                }
+                if (container) {
+                    const input = container.querySelector('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), select, textarea');
+                    if (input && input.id) return '#' + input.id;
+                    if (input && input.name) return '[name="' + input.name + '"]';
                 }
             }
             return null;
@@ -283,15 +302,6 @@ async def _find_element(session: BrowserSession, selector: str):
                 return found
     except Exception as e:
         logger.debug(f"[{session.token}] Label scan error: {e}")
-
-    # 4. Try by placeholder text
-    try:
-        locator = page.get_by_placeholder(selector, exact=False)
-        if await locator.count() > 0 and await locator.first.is_visible():
-            logger.info(f"[{session.token}] get_by_placeholder('{selector}') matched")
-            return ("placeholder", selector)
-    except Exception:
-        pass
 
     # 5. Try by visible text (for buttons, links)
     try:
@@ -315,45 +325,120 @@ async def _find_element(session: BrowserSession, selector: str):
 
 
 async def element_exists(session: BrowserSession, selector: str) -> bool:
-    """Quick check: does the selector resolve to a visible element on the current page?"""
+    """
+    Check if the selector resolves to an element that is truly visible and
+    reachable on the current page.  Uses bounding_box() which is more reliable
+    than is_visible() — it catches React/SPA components that are in the DOM
+    but hidden behind transitions (zero dimensions or wildly off-screen).
+    """
     page = session.page
-    try:
-        # Try CSS directly
-        el = await page.query_selector(selector)
-        if el and await el.is_visible():
-            return True
-    except Exception:
-        pass
+
+    def _bbox_ok(bbox) -> bool:
+        """Return True only if element has positive size and is on-screen."""
+        if not bbox:
+            return False
+        # Reject zero-size elements (React hidden panels)
+        if bbox["width"] <= 0 or bbox["height"] <= 0:
+            return False
+        # Reject elements positioned far off-screen (e.g. left: -9999px tricks)
+        if bbox["x"] < -50 or bbox["y"] < -50:
+            return False
+        return True
+
     try:
         loc = page.get_by_label(selector, exact=False)
-        if await loc.count() > 0 and await loc.first.is_visible():
-            return True
+        if await loc.count() > 0:
+            bbox = await loc.first.bounding_box()
+            if _bbox_ok(bbox):
+                return True
     except Exception:
         pass
     try:
         loc = page.get_by_placeholder(selector, exact=False)
-        if await loc.count() > 0 and await loc.first.is_visible():
-            return True
+        if await loc.count() > 0:
+            bbox = await loc.first.bounding_box()
+            if _bbox_ok(bbox):
+                return True
     except Exception:
         pass
     try:
         loc = page.get_by_role("button", name=selector, exact=False)
-        if await loc.count() > 0 and await loc.first.is_visible():
-            return True
+        if await loc.count() > 0:
+            bbox = await loc.first.bounding_box()
+            if _bbox_ok(bbox):
+                return True
     except Exception:
         pass
-    # Also try the JS label scan
+    try:
+        loc = page.get_by_role("link", name=selector, exact=False)
+        if await loc.count() > 0:
+            bbox = await loc.first.bounding_box()
+            if _bbox_ok(bbox):
+                return True
+    except Exception:
+        pass
+    # JS scan: look for matching label/placeholder and verify bounding rect
     try:
         found = await page.evaluate("""(labelText) => {
-            const labels = document.querySelectorAll('label');
-            for (const lbl of labels) {
-                const text = lbl.textContent.replace(/[\\s*]+/g, ' ').trim().toLowerCase();
-                if (text.includes(labelText.toLowerCase())) return true;
+            const lt = labelText.toLowerCase();
+
+            function inViewport(el) {
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return false;
+                if (r.x < -50 || r.y < -50)        return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                // Walk up to check parent visibility
+                let parent = el.parentElement;
+                while (parent && parent !== document.body) {
+                    const ps = window.getComputedStyle(parent);
+                    if (ps.display === 'none' || ps.visibility === 'hidden') return false;
+                    parent = parent.parentElement;
+                }
+                return true;
             }
-            // Also check placeholders
-            const inputs = document.querySelectorAll('input, textarea, select');
-            for (const inp of inputs) {
-                if (inp.placeholder && inp.placeholder.toLowerCase().includes(labelText.toLowerCase())) return true;
+
+            // Check labels
+            for (const lbl of document.querySelectorAll('label')) {
+                const text = lbl.textContent.replace(/[\\s*]+/g, ' ').trim().toLowerCase();
+                if (!text.includes(lt) && !lt.includes(text)) continue;
+                // Find associated input — direct association first
+                const input = lbl.control ||
+                              (lbl.htmlFor && document.getElementById(lbl.htmlFor)) ||
+                              lbl.querySelector('input, textarea, select');
+                if (input && inViewport(input)) return true;
+                // Walk up to row-level container and search all descendants
+                const rowSel = '.row, .form-group, .form-row, [class*="row"], [class*="form-group"], form, fieldset';
+                let container = lbl.closest(rowSel);
+                if (!container) {
+                    container = lbl.parentElement;
+                    if (container) container = container.parentElement || container;
+                    if (container) container = container.parentElement || container;
+                }
+                if (container) {
+                    const sibInput = container.querySelector('input:not([type="hidden"]), textarea, select');
+                    if (sibInput && inViewport(sibInput)) return true;
+                }
+                // React-Select: check for custom dropdown containers near this label
+                let p = lbl.parentElement;
+                for (let d = 0; d < 4 && p; d++) {
+                    const rs = p.querySelector('[class*="select__control"], [class*="-control"][class*="css-"]');
+                    if (rs && inViewport(rs)) return true;
+                    p = p.parentElement;
+                }
+                // Custom checkboxes/radios: the label itself is a valid clickable target
+                if (inViewport(lbl)) return true;
+            }
+            // Check placeholders
+            for (const inp of document.querySelectorAll('input, textarea, select')) {
+                if (inp.placeholder && inp.placeholder.toLowerCase().includes(lt)) {
+                    if (inViewport(inp)) return true;
+                }
+            }
+            // Check buttons / links
+            for (const btn of document.querySelectorAll('button, [role="button"], a')) {
+                const text = btn.textContent.trim().toLowerCase();
+                if (text.includes(lt) && inViewport(btn)) return true;
             }
             return false;
         }""", selector)
@@ -365,21 +450,37 @@ async def element_exists(session: BrowserSession, selector: str) -> bool:
 
 
 async def scan_page_fields(session: BrowserSession) -> list[dict]:
-    """Scan the current page and return a list of visible interactive form fields."""
+    """Scan the current page and return only truly visible interactive form fields."""
     page = session.page
     try:
         fields = await page.evaluate("""() => {
             const results = [];
             const seen = new Set();
-            
+
+            function inViewport(el) {
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return false;
+                if (r.x < -50 || r.y < -50)        return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                let parent = el.parentElement;
+                while (parent && parent !== document.body) {
+                    const ps = window.getComputedStyle(parent);
+                    if (ps.display === 'none' || ps.visibility === 'hidden') return false;
+                    parent = parent.parentElement;
+                }
+                return true;
+            }
+
             // Scan all visible inputs, textareas, selects
             const elements = document.querySelectorAll('input, textarea, select');
             for (const el of elements) {
-                if (el.type === 'hidden' || el.offsetParent === null) continue;
-                
+                if (el.type === 'hidden') continue;
+                if (!inViewport(el)) continue;
+
                 let label = '';
                 let fieldType = 'fill';
-                
+
                 // Get label text
                 if (el.id) {
                     const lbl = document.querySelector('label[for="' + el.id + '"]');
@@ -392,18 +493,18 @@ async def scan_page_fields(session: BrowserSession) -> list[dict]:
                 if (!label && el.placeholder) label = el.placeholder;
                 if (!label && el.name) label = el.name;
                 if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
-                
+
                 // Determine type
                 if (el.tagName === 'SELECT') fieldType = 'select';
                 else if (el.type === 'radio' || el.type === 'checkbox') fieldType = 'select';
                 else if (el.type === 'submit') fieldType = 'click';
                 else fieldType = 'fill';
-                
+
                 // Skip duplicates
                 const key = label + '|' + fieldType;
                 if (seen.has(key) || !label) continue;
                 seen.add(key);
-                
+
                 results.push({
                     label: label,
                     type: fieldType,
@@ -424,6 +525,30 @@ async def scan_page_fields(session: BrowserSession) -> list[dict]:
                 if (seen.has(key)) continue;
                 seen.add(key);
                 results.push({ label: text, type: 'click', tag: btn.tagName.toLowerCase(), inputType: '', name: '', id: btn.id || '' });
+            }
+
+            // Scan React-Select / custom dropdown containers
+            const rsControls = document.querySelectorAll('[class*="select__control"], [class*="-control"][class*="css-"]');
+            for (const ctrl of rsControls) {
+                if (!inViewport(ctrl)) continue;
+                // Try to get label from nearby <label>
+                let label = '';
+                let searchNode = ctrl.parentElement;
+                for (let d = 0; d < 5 && searchNode && !label; d++) {
+                    const lbl = searchNode.querySelector('label');
+                    if (lbl) label = lbl.textContent.replace(/[\\s*]+/g, ' ').trim();
+                    searchNode = searchNode.parentElement;
+                }
+                // Try placeholder text inside the react-select
+                if (!label) {
+                    const ph = ctrl.querySelector('[class*="placeholder"]');
+                    if (ph) label = ph.textContent.trim();
+                }
+                if (!label) continue;
+                const key = label + '|select';
+                if (seen.has(key)) continue;
+                seen.add(key);
+                results.push({ label: label, type: 'select', tag: 'div', inputType: 'react-select', name: '', id: '' });
             }
             
             return results;
@@ -561,6 +686,45 @@ async def prefill_input(session: BrowserSession, selector: str, value: str) -> b
         await session.page.keyboard.press("Backspace")
         await session.page.wait_for_timeout(100)
         await session.page.keyboard.type(value, delay=60)
+
+        # Handle date pickers — set value via JS then close popup
+        try:
+            is_datepicker = await session.page.evaluate("""() => {
+                const el = document.activeElement;
+                if (!el) return false;
+                return !!el.closest('.react-datepicker-wrapper, .react-datepicker__input-container, [class*="datepicker"]');
+            }""")
+            if is_datepicker:
+                # react-datepicker overrides typed text; set via React value setter
+                await session.page.evaluate("""(val) => {
+                    const el = document.activeElement;
+                    if (!el) return;
+                    const nativeSet = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    nativeSet.call(el, val);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }""", value)
+                await session.page.keyboard.press("Escape")
+                await session.page.wait_for_timeout(200)
+                logger.info(f"[{session.token}] Set date picker value for '{selector}'")
+        except Exception:
+            pass
+
+        # Handle autocomplete / tag inputs — press Enter to confirm selection
+        try:
+            is_autocomplete = await session.page.evaluate("""() => {
+                const el = document.activeElement;
+                if (!el) return false;
+                return !!el.closest('[class*="auto-complete"], [class*="autocomplete"], [class*="select__input"], [class*="tags-input"]');
+            }""")
+            if is_autocomplete:
+                await session.page.wait_for_timeout(500)
+                await session.page.keyboard.press("Enter")
+                await session.page.wait_for_timeout(200)
+                logger.info(f"[{session.token}] Confirmed autocomplete for '{selector}'")
+        except Exception:
+            pass
+
         logger.info(f"[{session.token}] Typed '{value}' into '{selector}'")
         return True
     except Exception as e:
@@ -594,39 +758,45 @@ async def select_option(session: BrowserSession, selector: str, value: str) -> b
     except Exception as e:
         logger.debug(f"[{session.token}] select dropdown attempt failed: {e}")
 
-    # Strategy 2: Try clicking a radio button with matching label text
+    # Strategy 2: Radio buttons / checkboxes — click LABEL (handles hidden custom inputs)
     try:
-        # Look for radio/checkbox input with value or label matching
         clicked = await page.evaluate("""(args) => {
             const [fieldLabel, optionValue] = args;
             const ov = optionValue.toLowerCase().trim();
-            
-            // Find all radio inputs
+
             const radios = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
             for (const radio of radios) {
+                let matched = false;
+                let lbl = null;
+
                 // Check associated label
-                const id = radio.id;
-                if (id) {
-                    const lbl = document.querySelector('label[for="' + id + '"]');
-                    if (lbl && lbl.textContent.trim().toLowerCase().includes(ov)) {
-                        radio.click();
-                        return true;
-                    }
+                if (radio.id) {
+                    lbl = document.querySelector('label[for="' + radio.id + '"]');
+                    if (lbl && lbl.textContent.trim().toLowerCase().includes(ov)) matched = true;
                 }
                 // Check value attribute
-                if (radio.value.toLowerCase().trim() === ov) {
-                    radio.click();
-                    return true;
-                }
+                if (!matched && radio.value.toLowerCase().trim() === ov) matched = true;
                 // Check next sibling text
-                const next = radio.nextSibling;
-                if (next && next.textContent && next.textContent.trim().toLowerCase().includes(ov)) {
-                    radio.click();
-                    return true;
+                if (!matched) {
+                    const next = radio.nextSibling;
+                    if (next && next.textContent && next.textContent.trim().toLowerCase().includes(ov)) matched = true;
                 }
                 // Check parent label
-                const parentLabel = radio.closest('label');
-                if (parentLabel && parentLabel.textContent.trim().toLowerCase().includes(ov)) {
+                if (!matched) {
+                    const parentLabel = radio.closest('label');
+                    if (parentLabel && parentLabel.textContent.trim().toLowerCase().includes(ov)) {
+                        lbl = lbl || parentLabel;
+                        matched = true;
+                    }
+                }
+
+                if (matched) {
+                    // Always prefer clicking the LABEL (works even when input is hidden by CSS)
+                    if (lbl) { lbl.click(); return true; }
+                    if (radio.id) {
+                        const fallback = document.querySelector('label[for="' + radio.id + '"]');
+                        if (fallback) { fallback.click(); return true; }
+                    }
                     radio.click();
                     return true;
                 }
@@ -639,7 +809,51 @@ async def select_option(session: BrowserSession, selector: str, value: str) -> b
     except Exception as e:
         logger.debug(f"[{session.token}] radio click attempt failed: {e}")
 
-    # Strategy 3: Try clicking text that matches the option value (general fallback)
+    # Strategy 3: React-Select / custom dropdown — click container, type value, Enter
+    try:
+        rs_found = await page.evaluate("""(args) => {
+            const [fieldLabel] = args;
+            const fl = fieldLabel.toLowerCase().trim();
+
+            // Find label matching the field name, look for react-select nearby
+            for (const lbl of document.querySelectorAll('label, [class*="label"]')) {
+                const text = (lbl.textContent || '').replace(/[\\s*]+/g, ' ').trim().toLowerCase();
+                if (!text.includes(fl)) continue;
+                let node = lbl.parentElement;
+                for (let d = 0; d < 5 && node; d++) {
+                    const ctrl = node.querySelector(
+                        '[class*="select__control"], [class*="-control"][class*="css-"], ' +
+                        '[class*="select__value-container"]'
+                    );
+                    if (ctrl) { ctrl.click(); return true; }
+                    node = node.parentElement;
+                }
+            }
+
+            // Try finding by placeholder text like "Select State"
+            for (const el of document.querySelectorAll('[class*="placeholder"]')) {
+                const t = (el.textContent || '').toLowerCase();
+                if (t.includes(fl) || t.includes('select ' + fl)) {
+                    const ctrl = el.closest('[class*="control"]');
+                    if (ctrl) { ctrl.click(); return true; }
+                    el.click(); return true;
+                }
+            }
+            return false;
+        }""", [selector])
+
+        if rs_found:
+            await page.wait_for_timeout(300)
+            await page.keyboard.type(value, delay=50)
+            await page.wait_for_timeout(500)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(300)
+            logger.info(f"[{session.token}] React-Select: selected '{value}' for '{selector}'")
+            return True
+    except Exception as e:
+        logger.debug(f"[{session.token}] React-Select attempt failed: {e}")
+
+    # Strategy 4: Try clicking text that matches the option value (general fallback)
     try:
         option_locator = page.get_by_text(value, exact=False).first
         if await option_locator.is_visible():

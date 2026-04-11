@@ -381,27 +381,12 @@ async def websocket_session(websocket: WebSocket, token: str):
                     logger.info(f"[WS:{token}] navigate result: {result}")
                     await bm.wait_for_page_stable(browser_session)
 
-                elif action == "fill" and selector:
+                elif action in ("fill", "select", "click", "highlight") and selector:
+                    # Only highlight during presentation — actual fill/select/click
+                    # happens AFTER the user clicks Done (prevents double-typing and
+                    # cursor-drift that confused earlier versions).
                     await bm.highlight_element(browser_session, selector)
-                    if prefill:
-                        await bm.prefill_input(browser_session, selector, prefill)
-                        prefill_values_collected[selector] = prefill
-                        logger.info(f"[WS:{token}] prefilled '{selector}' with '{prefill}'")
-
-                elif action == "select" and selector:
-                    await bm.highlight_element(browser_session, selector)
-                    if prefill:
-                        await bm.select_option(browser_session, selector, prefill)
-                        prefill_values_collected[selector] = prefill
-                        logger.info(f"[WS:{token}] selected '{prefill}' in '{selector}'")
-
-                elif action == "click" and selector:
-                    await bm.highlight_element(browser_session, selector)
-                    logger.info(f"[WS:{token}] highlighted click target '{selector}'")
-
-                elif action == "highlight" and selector:
-                    await bm.highlight_element(browser_session, selector)
-                    logger.info(f"[WS:{token}] highlight '{selector}'")
+                    logger.info(f"[WS:{token}] Highlighted '{selector}' for {action}")
 
                 elif action == "wait":
                     logger.info(f"[WS:{token}] Wait step, showing instruction only.")
