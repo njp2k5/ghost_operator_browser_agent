@@ -9,6 +9,7 @@ if sys.platform == "win32":
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
+from api.housing_ws import router as housing_ws_router
 from api.hindu_ws import router as hindu_ws_router
 from api.irctc_ws import router as irctc_ws_router
 from api.linkedin_ws import router as linkedin_ws_router  # file retained; now serves /ws/olx
@@ -26,10 +27,11 @@ load_builtin_tools()
 
 app = FastAPI()
 
-app.include_router(hindu_ws_router)        # /ws/hindu/news
-app.include_router(irctc_ws_router)        # /ws/irctc  — specific routes before wildcard
-app.include_router(linkedin_ws_router)     # /ws/olx
-app.include_router(ws_router)              # /ws/{sender}  — wildcard last
+app.include_router(housing_ws_router)
+app.include_router(hindu_ws_router)
+app.include_router(irctc_ws_router)  # specific routes first - must precede wildcard /ws/{sender}
+app.include_router(linkedin_ws_router)  # specific routes first - must precede wildcard /ws/{sender}
+app.include_router(ws_router)
 
 
 @app.get("/")
