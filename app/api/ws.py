@@ -10,9 +10,62 @@ from services.memory_service import memory_service
 from tool_registry.executor import execute_tool
 from tool_registry.registry import list_tools
 
+# Inline sub-handlers — pure async fetch functions imported directly
+from api.linkedin_ws import _fetch_olx_results
+from api.hindu_ws import _fetch_hindu_news
+from api.irctc_ws import _fetch_irctc_results, _fallback_irctc_results, _detect_intent
+
 router = APIRouter()
 
 CHAT_SYSTEM_PROMPT = "WhatsApp AI assistant"
+
+# ---------------------------------------------------------------------------
+# Inline WS tools — handled in this module, NOT via the tool registry executor
+# ---------------------------------------------------------------------------
+_INLINE_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "olx_search",
+        "description": "Search OLX India listings for second-hand goods, vehicles, real estate, and jobs.",
+        "input_schema": {
+            "properties": {
+                "query": {"type": "string", "description": "Product or listing search query"},
+                "limit": {"type": "integer", "description": "Number of results (1-20)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "irctc_search",
+        "description": "Search IRCTC for trains, fares, PNR status, and ticket booking.",
+        "input_schema": {
+            "properties": {
+                "query": {"type": "string", "description": "Full query including from/to stations and date if applicable"},
+                "limit": {"type": "integer", "description": "Number of results (1-10)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "hindu_news",
+        "description": "Fetch latest news headlines from The Hindu newspaper by section.",
+        "input_schema": {
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Section name: national, international, business, sport, technology, "
+                        "science, entertainment, education, opinion, cities, environment, health, "
+                        "law, agriculture, life-and-style, real-estate, immigration, premium, front-page"
+                    ),
+                    "default": "national",
+                },
+                "limit": {"type": "integer", "description": "Number of articles (1-15)", "default": 5},
+            },
+        },
+    },
+]
+
+_INLINE_TOOL_NAMES: frozenset[str] = frozenset(t["name"] for t in _INLINE_TOOLS)
 
 TOOL_ROUTER_PROMPT_TEMPLATE = """
 You are a tool router for a WhatsApp assistant.
@@ -31,9 +84,14 @@ Available tools:
 
 Rules:
 - Use `amazon_search` for Amazon product discovery, price checks, and product comparisons.
-- For `amazon_search`, set params.query to the main product query text.
-- You may set params.limit (1-20) and params.marketplace (for example: www.amazon.in).
-- If no tool is needed, return use_tool=false and tool="".
+  Set params.query to the product query. You may set params.limit (1-20) and params.marketplace.
+- Use `olx_search` for OLX India listings, second-hand goods, used products, used cars/bikes, buy/sell.
+  Set params.query to the search term and optionally params.limit.
+- Use `irctc_search` for train travel, IRCTC ticket booking, PNR status, train schedules, fares.
+  Set params.query to the full user query (preserve station names and dates).
+- Use `hindu_news` for news queries, current events, headlines, sports, business, technology news.
+  Set params.section to the best matching section from the available list. Optionally set params.limit.
+- If no tool is needed (general chat, greetings, opinions, calculations), return use_tool=false and tool="".
 """
 
 TOOL_RESPONSE_PROMPT = """
@@ -149,8 +207,9 @@ def _parse_incoming_message(raw_text: str) -> str:
 
 
 def _safe_router_decision(message: str) -> dict[str, Any]:
+    # Merge registry tools (amazon_search etc.) with inline WS tools
     tool_defs = list_tools()
-    compact_defs = [
+    compact_registry = [
         {
             "name": item.get("name"),
             "description": item.get("description"),
@@ -158,9 +217,10 @@ def _safe_router_decision(message: str) -> dict[str, Any]:
         }
         for item in tool_defs
     ]
+    all_tools = compact_registry + _INLINE_TOOLS
 
     router_prompt = TOOL_ROUTER_PROMPT_TEMPLATE.format(
-        tools_json=json.dumps(compact_defs, ensure_ascii=False)
+        tools_json=json.dumps(all_tools, ensure_ascii=False)
     )
     raw = llm_service.generate(
         [
@@ -181,8 +241,12 @@ def _safe_router_decision(message: str) -> dict[str, Any]:
     if not isinstance(params, dict):
         params = {}
 
-    # Fallback: if router picks amazon_search without query, use full user message.
+    # Fallback: ensure query params are populated from the raw user message when missing
     if tool == "amazon_search" and not str(params.get("query", "")).strip():
+        params["query"] = message
+    if tool == "olx_search" and not str(params.get("query", "")).strip():
+        params["query"] = message
+    if tool == "irctc_search" and not str(params.get("query", "")).strip():
         params["query"] = message
 
     return {
@@ -191,6 +255,114 @@ def _safe_router_decision(message: str) -> dict[str, Any]:
         "params": params,
         "reason": str(parsed.get("reason", "")).strip(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Inline tool result formatters
+# ---------------------------------------------------------------------------
+
+def _format_olx_reply(results: list[dict[str, Any]], query: str) -> str:
+    if not results:
+        return f"No OLX listings found for '{query}'. Try a different search term."
+    lines: list[str] = []
+    for i, item in enumerate(results, 1):
+        title = str(item.get("title") or "Listing").strip()
+        price = str(item.get("price") or "").strip()
+        location = str(item.get("location") or "").strip()
+        url = str(item.get("url") or "").strip()
+        meta_parts = [v for v in [price, location] if v]
+        meta = " | ".join(meta_parts) if meta_parts else "details not available"
+        line = f"{i}. *{title}* — {meta}"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    return f"Found {len(lines)} OLX listing(s) for '{query}':\n\n" + "\n\n".join(lines)
+
+
+def _format_irctc_reply(results: list[dict[str, Any]], query: str) -> str:
+    if not results:
+        return f"No IRCTC results found for '{query}'. Try https://www.irctc.co.in directly."
+    lines: list[str] = []
+    for i, item in enumerate(results, 1):
+        title = str(item.get("title") or "Result").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        url = str(item.get("url") or "").strip()
+        line = f"{i}. *{title}*"
+        if snippet:
+            line += f"\n   {snippet[:150]}{'...' if len(snippet) > 150 else ''}"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    return f"IRCTC results for '{query}':\n\n" + "\n\n".join(lines)
+
+
+def _format_hindu_reply(results: list[dict[str, Any]], section: str) -> str:
+    if not results:
+        return f"No Hindu news articles found for section '{section}'."
+    lines: list[str] = []
+    for i, item in enumerate(results, 1):
+        title = str(item.get("title") or "Article").strip()
+        url = str(item.get("url") or "").strip()
+        published = str(item.get("published") or "").strip()
+        description = str(item.get("description") or "").strip()
+        line = f"{i}. *{title}*"
+        if published:
+            line += f" ({published})"
+        if description:
+            line += f"\n   {description[:120]}{'...' if len(description) > 120 else ''}"
+        if url:
+            line += f"\n   {url}"
+        lines.append(line)
+    return f"Latest The Hindu news ({section}):\n\n" + "\n\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Inline tool dispatcher — runs sub-handler on the same websocket connection
+# ---------------------------------------------------------------------------
+
+async def _dispatch_inline_tool(
+    sender: str,
+    tool_name: str,
+    params: dict[str, Any],
+    original_message: str,
+) -> str:
+    """Execute an inline WS tool and return a formatted reply string."""
+
+    if tool_name == "olx_search":
+        query = str(params.get("query") or original_message).strip()
+        limit = max(1, min(int(params.get("limit") or 5), 20))
+        await manager.send(sender, f"Searching OLX for '{query}'...")
+        try:
+            results = await _fetch_olx_results(query, limit)
+        except Exception as exc:  # noqa: BLE001
+            return f"OLX search failed: {exc}"
+        return _format_olx_reply(results, query)
+
+    if tool_name == "irctc_search":
+        query = str(params.get("query") or original_message).strip()
+        limit = max(1, min(int(params.get("limit") or 5), 10))
+        await manager.send(sender, f"Searching IRCTC for '{query}'...")
+        try:
+            results = await _fetch_irctc_results(query, limit)
+        except Exception:  # noqa: BLE001
+            results = []
+        if not results:
+            intent = _detect_intent(query)
+            results = _fallback_irctc_results(query, intent, limit)
+        return _format_irctc_reply(results, query)
+
+    if tool_name == "hindu_news":
+        section = str(params.get("section") or "national").strip().lower()
+        limit = max(1, min(int(params.get("limit") or 5), 15))
+        await manager.send(sender, f"Fetching The Hindu {section} news...")
+        try:
+            results = await _fetch_hindu_news(section, limit)
+        except Exception as exc:  # noqa: BLE001
+            return f"The Hindu news fetch failed: {exc}"
+        return _format_hindu_reply(results, section)
+
+    return ""
+
 
 @router.websocket("/ws/{sender}")
 async def websocket_endpoint(websocket: WebSocket, sender: str):
@@ -217,21 +389,28 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
             if decision.get("use_tool") and decision.get("tool"):
                 tool_name = str(decision["tool"])
                 tool_params = decision.get("params", {})
-                tool_result = await execute_tool(tool_name, tool_params)
-                reply = _build_tool_reply(tool_name, tool_result)
 
-                if not reply:
-                    messages = [
-                        {"role": "system", "content": TOOL_RESPONSE_PROMPT},
-                        *history,
-                        {
-                            "role": "system",
-                            "content": "Tool result JSON:\n"
-                            + json.dumps(tool_result, ensure_ascii=False),
-                        },
-                    ]
+                if tool_name in _INLINE_TOOL_NAMES:
+                    # Inline WS tools — run sub-handler directly on this connection
+                    reply = await _dispatch_inline_tool(sender, tool_name, tool_params, message)
+                    if not reply:
+                        reply = "I could not retrieve results for your query. Please try again."
+                else:
+                    # Registry tools (e.g. amazon_search) — go through tool executor
+                    tool_result = await execute_tool(tool_name, tool_params)
+                    reply = _build_tool_reply(tool_name, tool_result)
 
-                    reply = llm_service.generate(messages, temperature=0.2, max_tokens=450)
+                    if not reply:
+                        messages = [
+                            {"role": "system", "content": TOOL_RESPONSE_PROMPT},
+                            *history,
+                            {
+                                "role": "system",
+                                "content": "Tool result JSON:\n"
+                                + json.dumps(tool_result, ensure_ascii=False),
+                            },
+                        ]
+                        reply = llm_service.generate(messages, temperature=0.2, max_tokens=450)
             else:
                 # prepend system
                 messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + history

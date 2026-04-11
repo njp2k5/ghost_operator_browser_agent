@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import re
+import sys
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -8,6 +11,29 @@ import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+
+
+async def _run_in_proactor_thread(coro_func, *args, **kwargs):
+    """Run a Playwright coroutine in a dedicated thread with its own ProactorEventLoop.
+
+    Uvicorn on Windows uses SelectorEventLoop which cannot spawn subprocesses
+    (required by Playwright). This wrapper offloads the coroutine to a thread
+    that owns a fresh ProactorEventLoop, avoiding the NotImplementedError.
+    """
+    running_loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        def _thread():
+            if sys.platform == "win32":
+                new_loop = asyncio.ProactorEventLoop()
+            else:
+                new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                return new_loop.run_until_complete(coro_func(*args, **kwargs))
+            finally:
+                new_loop.close()
+                asyncio.set_event_loop(None)
+        return await running_loop.run_in_executor(pool, _thread)
 
 BROWSER_TIMEOUT_MS = 25000
 NAV_TIMEOUT_MS = 45000
@@ -245,6 +271,9 @@ class IRCTCBrowserService:
         return False
 
     async def get_pnr_status(self, pnr: str) -> dict[str, Any]:
+        return await _run_in_proactor_thread(self._get_pnr_status_playwright, pnr)
+
+    async def _get_pnr_status_playwright(self, pnr: str) -> dict[str, Any]:
         playwright, browser, context, page = await self._open_page()
         try:
             await self._goto_irctc_train_search(page)
@@ -329,6 +358,23 @@ class IRCTCBrowserService:
             await self._close_page(playwright, browser, context, page)
 
     async def search_trains_with_fare(
+        self,
+        from_station: str,
+        to_station: str,
+        date_of_journey: str,
+        travel_class: str | None,
+        limit: int,
+    ) -> list[dict[str, str]]:
+        return await _run_in_proactor_thread(
+            self._search_trains_with_fare_playwright,
+            from_station,
+            to_station,
+            date_of_journey,
+            travel_class,
+            limit,
+        )
+
+    async def _search_trains_with_fare_playwright(
         self,
         from_station: str,
         to_station: str,
