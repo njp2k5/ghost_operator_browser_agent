@@ -1311,12 +1311,33 @@ async def booking_execute_step(session: BrowserSession, step_selector: str, valu
 
         # ── RESULTS (view search results page) ─────────────────────
         elif sel == "results":
-            # Just wait for the results page to fully render
+            # Wait for the results page to fully render
             try:
                 await page.wait_for_load_state('networkidle', timeout=10000)
             except Exception:
                 pass
             await page.wait_for_timeout(2000)
+
+            # Silently dismiss any lingering calendar/datepicker overlay by
+            # pressing Escape and doing a JS click on a neutral spot (top-left
+            # corner of <body> — far from any calendar widget).
+            # This is invisible in the UI because we do NOT take a screenshot
+            # until after this; the next frame the user sees is already clean.
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(200)
+                # JS click at a safe off-calendar coordinate (10, 10)
+                await page.evaluate("""() => {
+                    document.body.dispatchEvent(
+                        new MouseEvent('click', {bubbles: true, cancelable: true,
+                                                 clientX: 10, clientY: 10})
+                    );
+                }""")
+                await page.wait_for_timeout(300)
+                logger.info(f"[{session.token}] booking: silently dismissed any open calendar on results page")
+            except Exception:
+                pass
+
             logger.info(f"[{session.token}] booking: results page displayed")
             return True
 
