@@ -294,14 +294,7 @@ def _safe_router_decision(message: str) -> dict[str, Any]:
     if not isinstance(params, dict):
         params = {}
 
-<<<<<<< HEAD
-    # Fallback: ensure query params are populated from the raw user message when missing
-=======
-    if tool == "amazon_account" and not str(params.get("user_input", "")).strip():
-        params["user_input"] = message
-
     # Fallback: if router picks amazon_search without query, use full user message.
->>>>>>> 33c1271 (added amazon login and order details)
     if tool == "amazon_search" and not str(params.get("query", "")).strip():
         params["query"] = message
     if tool == "olx_search" and not str(params.get("query", "")).strip():
@@ -459,55 +452,13 @@ async def websocket_endpoint(websocket: WebSocket, sender: str):
             else:
                 decision = _safe_router_decision(message)
 
-                if not decision.get("use_tool") and _looks_like_amazon_account_intent(message):
-                    decision = {
-                        "use_tool": True,
-                        "tool": "amazon_account",
-                        "params": {
-                            "session_id": sender,
-                            "user_input": message,
-                        },
-                        "reason": "explicit amazon account intent",
-                    }
-
-                if decision.get("use_tool") and decision.get("tool"):
-                    tool_name = str(decision["tool"])
-                    tool_params = decision.get("params", {})
-                    if not isinstance(tool_params, dict):
-                        tool_params = {}
-
-                    if tool_name == "amazon_account":
-                        tool_params.setdefault("session_id", sender)
-                        tool_params.setdefault("user_input", message)
-
-                    tool_result = await execute_tool(tool_name, tool_params)
-
-            if tool_name and tool_result is not None:
-                if tool_name == "amazon_account":
-                    if bool(tool_result.get("session_active", False)):
-                        AMAZON_ACCOUNT_ACTIVE_SESSIONS.add(sender)
-                    else:
-                        AMAZON_ACCOUNT_ACTIVE_SESSIONS.discard(sender)
-
-<<<<<<< HEAD
             if decision.get("use_tool") and decision.get("tool"):
                 tool_name = str(decision["tool"])
                 tool_params = decision.get("params", {})
-=======
+                tool_result = await execute_tool(tool_name, tool_params)
                 reply = _build_tool_reply(tool_name, tool_result)
->>>>>>> 33c1271 (added amazon login and order details)
 
-                if tool_name in _INLINE_TOOL_NAMES:
-                    # Inline WS tools — run sub-handler directly on this connection
-                    reply = await _dispatch_inline_tool(sender, tool_name, tool_params, message)
-                    if not reply:
-                        reply = "I could not retrieve results for your query. Please try again."
-                else:
-                    # Registry tools (e.g. amazon_search) — go through tool executor
-                    tool_result = await execute_tool(tool_name, tool_params)
-                    reply = _build_tool_reply(tool_name, tool_result)
-
-                    if not reply:
+                if not reply:
                         messages = [
                             {"role": "system", "content": TOOL_RESPONSE_PROMPT},
                             *history,
