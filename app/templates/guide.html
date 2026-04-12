@@ -2,14 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- viewport-fit=cover fills iPhone notch area -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>FuncLink — Guided Session</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    /* Lock the page to full height — prevents scrolling the shell on mobile */
+    html, body { height: 100%; overflow: hidden; }
     #browser-canvas { image-rendering: crisp-edges; }
-    .pulse-ring {
-      animation: pulse-ring 1.5s ease-out infinite;
-    }
+    .pulse-ring { animation: pulse-ring 1.5s ease-out infinite; }
     @keyframes pulse-ring {
       0%   { box-shadow: 0 0 0 0 rgba(34,211,238,0.5); }
       70%  { box-shadow: 0 0 0 12px rgba(34,211,238,0); }
@@ -17,53 +18,58 @@
     }
   </style>
 </head>
-<body class="bg-gray-950 text-white min-h-screen flex flex-col">
+<body class="bg-gray-950 text-white h-full flex flex-col overflow-hidden">
 
   <!-- Header -->
-  <header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center gap-3">
-    <div class="w-3 h-3 rounded-full bg-cyan-400 pulse-ring"></div>
-    <span class="font-semibold text-sm tracking-wide text-cyan-400">FuncLink</span>
-    <span class="text-gray-400 text-sm">|</span>
-    <span id="task-label" class="text-gray-300 text-sm truncate">{{ task }}</span>
+  <header class="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center gap-3 flex-none">
+    <div class="w-3 h-3 rounded-full bg-cyan-400 flex-none pulse-ring"></div>
+    <span class="font-semibold text-sm tracking-wide text-cyan-400 flex-none">FuncLink</span>
+    <span class="text-gray-400 text-sm flex-none">|</span>
+    <span id="task-label" class="text-gray-300 text-sm truncate min-w-0">{{ task }}</span>
   </header>
 
   <!-- Step progress bar -->
-  <div class="bg-gray-900 px-4 py-2 border-b border-gray-800">
+  <div class="bg-gray-900 px-4 py-2 border-b border-gray-800 flex-none">
     <div class="flex items-center justify-between mb-1">
-      <span id="step-label" class="text-xs text-gray-400">Connecting...</span>
-      <span id="step-count" class="text-xs text-cyan-400 font-mono"></span>
+      <span id="step-label" class="text-xs text-gray-400 truncate pr-2">Connecting...</span>
+      <span id="step-count" class="text-xs text-cyan-400 font-mono flex-none"></span>
     </div>
     <div class="w-full bg-gray-800 rounded-full h-1.5">
       <div id="progress-bar" class="bg-cyan-400 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
     </div>
   </div>
 
-  <!-- Main content -->
-  <div class="flex flex-col lg:flex-row flex-1 gap-0 overflow-hidden">
+  <!-- Main content — column on mobile, row on desktop -->
+  <div class="flex flex-col lg:flex-row flex-1 min-h-0">
 
     <!-- Browser viewport -->
-    <div class="flex-1 bg-black flex items-center justify-center overflow-hidden relative">
-      <!-- img tag renders JPEG directly — much faster than canvas -->
+    <!-- Mobile: fixed height (~40% of typical phone screen), Desktop: fills remaining space -->
+    <div class="relative bg-black flex items-center justify-center overflow-hidden
+                flex-none h-40 sm:h-52
+                lg:flex-1 lg:h-auto">
       <img id="browser-view" class="max-w-full max-h-full object-contain" alt="Browser view" />
       <!-- Overlay when loading -->
       <div id="loading-overlay" class="absolute inset-0 bg-gray-950 flex flex-col items-center justify-center gap-4">
         <div id="loading-spinner" class="w-10 h-10 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
-        <p id="overlay-msg" class="text-gray-400 text-sm">Starting guided session...</p>
+        <p id="overlay-msg" class="text-gray-400 text-sm text-center px-6">Starting guided session...</p>
         <button id="retry-btn" onclick="connect()" class="hidden mt-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-sm">↺ Retry</button>
       </div>
     </div>
 
-    <!-- Instruction panel -->
-    <div class="lg:w-80 bg-gray-900 border-t lg:border-t-0 lg:border-l border-gray-800 flex flex-col overflow-y-auto" style="max-height: 100vh;">
+    <!-- Instruction panel — fills remaining height on mobile, fixed width on desktop -->
+    <div class="flex-1 min-h-0 lg:flex-none lg:w-80
+                bg-gray-900 border-t lg:border-t-0 lg:border-l border-gray-800
+                flex flex-col overflow-hidden">
 
-      <!-- Instruction + button all in one scrollable block -->
-      <div class="p-4 flex flex-col gap-3">
+      <!-- Scrollable instruction content -->
+      <div class="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+
         <div id="instruction-card" class="bg-gray-800 rounded-xl p-4 border border-gray-700 hidden">
           <div class="flex items-start gap-3">
-            <div id="action-icon" class="text-2xl mt-0.5">👆</div>
-            <div>
+            <div id="action-icon" class="text-2xl mt-0.5 flex-none">👆</div>
+            <div class="min-w-0">
               <p id="action-label" class="text-xs text-cyan-400 font-semibold uppercase tracking-widest mb-1">Action</p>
-              <p id="instruction-text" class="text-white text-sm leading-relaxed"></p>
+              <p id="instruction-text" class="text-white text-sm leading-relaxed break-words"></p>
             </div>
           </div>
         </div>
@@ -71,28 +77,38 @@
         <!-- Input capture (shown for FILL steps) -->
         <div id="fill-box" class="hidden">
           <label class="text-xs text-gray-400 mb-1 block">Enter value:</label>
+          <!-- text-base = 16px prevents iOS auto-zoom on focus -->
           <input id="fill-input" type="text"
-            class="w-full bg-gray-800 border border-cyan-500 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:ring-2 focus:ring-cyan-400"
+            inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            class="w-full bg-gray-800 border border-cyan-500 rounded-lg px-3 py-3
+                   text-white text-base focus:outline-none focus:ring-2 focus:ring-cyan-400"
             placeholder="Type here..."
           />
         </div>
-
-        <!-- Done button — right below the instruction -->
-        <button id="done-btn"
-          class="w-full bg-cyan-500 hover:bg-cyan-400 active:scale-95 text-gray-950 font-bold py-3 px-6 rounded-xl transition-all duration-150 text-sm hidden"
-          onclick="sendDone()">
-          ✓ Done — Next Step
-        </button>
 
         <!-- Status messages -->
         <div id="status-msg" class="text-xs text-gray-500 text-center hidden"></div>
 
         <!-- Completion banner -->
-        <div id="complete-banner" class="hidden text-center py-4">
-          <div class="text-4xl mb-2">🎉</div>
-          <p class="text-cyan-400 font-bold">All steps complete!</p>
-          <p class="text-gray-400 text-xs mt-1">You can close this window.</p>
+        <div id="complete-banner" class="hidden text-center py-6">
+          <div class="text-5xl mb-3">🎉</div>
+          <p class="text-cyan-400 font-bold text-lg">All steps complete!</p>
+          <p class="text-gray-400 text-sm mt-1">You can close this window.</p>
         </div>
+
+      </div>
+
+      <!-- Done button — always pinned to bottom of panel, never hidden behind keyboard -->
+      <div class="flex-none p-3 bg-gray-900 border-t border-gray-800"
+           style="padding-bottom: max(12px, env(safe-area-inset-bottom));">
+        <button id="done-btn"
+          class="w-full bg-cyan-500 hover:bg-cyan-400 active:scale-95
+                 text-gray-950 font-bold py-4 px-6 rounded-xl
+                 transition-all duration-150 text-base hidden
+                 touch-manipulation select-none"
+          onclick="sendDone()">
+          ✓ Done — Next Step
+        </button>
       </div>
 
     </div>
@@ -353,7 +369,5 @@
     connect();
   </script>
 
-  <!-- Debug log panel (remove in production) -->
-  <div style="position:fixed;bottom:0;left:0;right:0;max-height:120px;overflow-y:auto;background:#111;border-top:1px solid #333;padding:4px 8px;font-family:monospace;font-size:11px;color:#0f0;z-index:9999;" id="debug-log"></div>
 </body>
 </html>
