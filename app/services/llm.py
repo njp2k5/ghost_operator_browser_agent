@@ -139,6 +139,7 @@ RULES:
 - For dropdowns / radio buttons: action = "select", set prefill_value = the option to pick.
 - For buttons/links: action = "click".
 - Keep the plan MINIMAL — one step per field.
+- IMPORTANT: For search boxes (type=search, or label/placeholder contains "search"), do NOT add a separate "click" step for the search button — pressing Enter is handled automatically after typing.
 - Do NOT include markdown, code fences, or explanation — ONLY the raw JSON array.
 """
 

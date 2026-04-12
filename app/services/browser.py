@@ -804,6 +804,47 @@ async def prefill_input(session: BrowserSession, selector: str, value: str) -> b
         except Exception:
             pass
 
+        # Handle search inputs — press Enter to submit search
+        # Trigger if: type=search, OR name/id/placeholder contains search/query,
+        # OR it's the only input in a form with no submit button
+        try:
+            is_search = await session.page.evaluate("""() => {
+                const el = document.activeElement;
+                if (!el) return false;
+                const type        = (el.type        || '').toLowerCase();
+                const name        = (el.name        || '').toLowerCase();
+                const id          = (el.id          || '').toLowerCase();
+                const placeholder = (el.placeholder || '').toLowerCase();
+                const ariaLabel   = (el.getAttribute('aria-label') || '').toLowerCase();
+                const role        = (el.getAttribute('role')        || '').toLowerCase();
+
+                if (type === 'search') return true;
+                if (role === 'searchbox') return true;
+                if (name === 'q' || name === 'query' || name.includes('search')) return true;
+                if (id.includes('search') || id.includes('query')) return true;
+                if (placeholder.includes('search')) return true;
+                if (ariaLabel.includes('search')) return true;
+
+                // Only input in its form and form has no submit button → treat as search
+                if (el.form) {
+                    const visibleInputs = [...el.form.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"])'
+                    )].filter(i => i.offsetParent !== null);
+                    const submitBtns = [...el.form.querySelectorAll(
+                        'button[type="submit"], input[type="submit"]'
+                    )].filter(b => b.offsetParent !== null);
+                    if (visibleInputs.length === 1 && submitBtns.length === 0) return true;
+                }
+                return false;
+            }""")
+            if is_search:
+                await session.page.wait_for_timeout(400)
+                await session.page.keyboard.press("Enter")
+                await session.page.wait_for_timeout(600)
+                logger.info(f"[{session.token}] Pressed Enter for search input '{selector}'")
+        except Exception:
+            pass
+
         logger.info(f"[{session.token}] Typed '{value}' into '{selector}'")
         return True
     except Exception as e:
