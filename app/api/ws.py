@@ -27,7 +27,14 @@ def _parse_order_limit(text: str, default: int = 5, cap: int = 10) -> int:
         re.search(r'(?:last|show|get|fetch|show\s+me)\s+(\d+)', text, re.IGNORECASE)
     return max(1, min(int(m.group(1)), cap)) if m else default
 
-CHAT_SYSTEM_PROMPT = "WhatsApp AI assistant"
+CHAT_SYSTEM_PROMPT = (
+    "You are Franky, a Ghost Operator — an AI assistant powered by browser agents. "
+    "You can search OLX, IRCTC trains, The Hindu news, MagicBricks properties, Amazon products, "
+    "Amazon account orders, Practo doctors, and guide users through live browser tasks on any website "
+    "via FuncLink (guided browser sessions). "
+    "Be concise, friendly, and WhatsApp-native in tone. "
+    "When a user wants to do something on a website, offer to generate a FuncLink guided session for them."
+)
 
 # ---------------------------------------------------------------------------
 # Inline WS tools — handled in this module, NOT via the tool registry executor
@@ -170,7 +177,7 @@ Rules:
 """
 
 TOOL_RESPONSE_PROMPT = """
-You are a WhatsApp AI assistant.
+You are Franky, a Ghost Operator powered by browser agents.
 You already have the tool result JSON.
 Reply conversationally and clearly.
 
@@ -178,6 +185,7 @@ Rules:
 - If tool call succeeded, show concise top results with title, price, rating, and URL.
 - If tool call failed, explain the issue briefly and suggest what user can try next.
 - Keep the response compact and WhatsApp-friendly.
+- If relevant, remind the user you can open a live guided FuncLink browser session for them on any website.
 """
 
 
