@@ -15,6 +15,7 @@ from tool_registry.registry import list_tools
 from api.linkedin_ws import _fetch_olx_results
 from api.hindu_ws import _fetch_hindu_news
 from api.irctc_ws import _fetch_irctc_results, _fallback_irctc_results, _detect_intent
+from services.funclink_service import create_funclink_session
 
 router = APIRouter()
 AMAZON_ACCOUNT_ACTIVE_SESSIONS: set[str] = set()
@@ -97,6 +98,18 @@ _INLINE_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "funclink_guide",
+        "description": "Open a live guided browser session that walks the user through a task on any website (e.g. booking hotels, filling forms, searching flights).",
+        "input_schema": {
+            "properties": {
+                "task": {"type": "string", "description": "Full natural-language description of what the user wants to do, including destination, dates, guests etc."},
+                "target_url": {"type": "string", "description": "Root URL of the website to open (e.g. https://www.booking.com)"},
+                "website_name": {"type": "string", "description": "Human-readable website name, e.g. Booking.com", "default": ""},
+            },
+            "required": ["task", "target_url"],
+        },
+    },
+    {
         "name": "practo_search",
         "description": "Find doctors and specialists on Practo by city, speciality, and locality.",
         "input_schema": {
@@ -147,6 +160,12 @@ Rules:
   Set params.city to the target city. Set params.purpose to rent or buy. Set params.query for extra keywords.
 - Use `practo_search` for doctor search, clinic search, specialist discovery, consultation fee queries.
   Set params.city to the city name. Set params.speciality to the type of doctor (dentist, dermatologist etc). Set params.locality if mentioned.
+- Use `funclink_guide` when the user wants to be guided through a task on ANY external website — e.g.
+  "guide me through booking a hotel on Booking.com", "help me search flights on MakeMyTrip",
+  "walk me through buying on Flipkart", "book a cab on Ola", "open Airbnb and find a room".
+  Set params.task to the full natural-language task (preserve destination, dates, guests, any details).
+  Set params.target_url to the root URL of the website (e.g. https://www.booking.com).
+  Set params.website_name to the friendly name (e.g. Booking.com).
 - If no tool is needed (general chat, greetings, opinions, calculations), return use_tool=false and tool="".
 """
 
@@ -623,6 +642,34 @@ async def _dispatch_inline_tool(
         else:
             await manager.send(sender, "⚠️ Live scrape returned nothing, loading fallback Practo links...")
         return _format_practo_reply(result)
+
+    if tool_name == "funclink_guide":
+        task = str(params.get("task") or original_message).strip()
+        target_url = str(params.get("target_url") or "").strip()
+        website_name = str(params.get("website_name") or target_url).strip()
+        if not target_url:
+            return "I need to know which website you want to use. For example: *guide me through booking hotels on Booking.com*."
+        await manager.send(sender, f"🌐 Creating a live guided session for *{website_name}*...")
+        await manager.send(sender, "⚙️ FuncLink is building your step-by-step browser guide...")
+        try:
+            data = await create_funclink_session(
+                user_id=sender,
+                task=task,
+                target_url=target_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not create a guided session right now: {exc}. Please try again shortly."
+        guided_url = str(data.get("url") or "").strip()
+        step_count = data.get("step_count") or ""
+        if not guided_url:
+            return "FuncLink returned an empty link. Please try again."
+        steps_note = f" ({step_count} guided steps)" if step_count else ""
+        return (
+            f"✅ Your guided session is ready{steps_note}!\n\n"
+            f"👇 Open this link in your browser — it will walk you through the task step by step:\n"
+            f"{guided_url}\n\n"
+            f"_Task: {task}_"
+        )
 
     return ""
 

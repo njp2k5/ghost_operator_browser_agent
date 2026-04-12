@@ -49,6 +49,32 @@ def health():
     return {"status": "ok"}
 
 
+class FuncLinkWebhookPayload(BaseModel):
+    user_id: str
+    status: str
+    task: str
+    token: str
+
+
+@app.post("/webhook/funclink")
+async def funclink_webhook(payload: FuncLinkWebhookPayload):
+    """Receive session-complete notifications from FuncLink."""
+    import logging
+    log = logging.getLogger("ghost_operator.funclink_webhook")
+    log.info(
+        "[webhook] user=%s status=%s token=%s task=%r",
+        payload.user_id, payload.status, payload.token, payload.task,
+    )
+    if payload.status == "complete":
+        from core.websocket_manager import manager
+        await manager.send(
+            payload.user_id,
+            f"✅ Your guided session on *{payload.task}* is complete!\n"
+            f"Hope everything went smoothly. Let me know if you need anything else.",
+        )
+    return {"received": True}
+
+
 @app.post("/test/tool")
 async def test_tool(payload: ToolExecutionRequest):
     return await execute_tool(payload.tool, payload.params)
