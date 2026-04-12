@@ -153,7 +153,7 @@ Rules:
     check order history, or ask order status.
 - For `amazon_account`, include params.session_id as sender id and params.user_input
     as the latest user message.
-- For `amazon_account`, prefer params.headless=false unless user explicitly asks for headless.
+- For `amazon_account`, always use params.headless=false.
 - For `amazon_account`, if the user asks for a specific number of orders (e.g. "last 10 orders", "show me 3 orders"), set params.limit to that number (max 10). Otherwise omit it.
 - Use `amazon_search` for Amazon product discovery, price checks, and product comparisons.
   Set params.query to the product query. You may set params.limit (1-20) and params.marketplace.

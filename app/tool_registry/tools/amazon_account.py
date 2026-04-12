@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 from tool_registry.registry import register_tool
 
 DEFAULT_MARKETPLACE = "www.amazon.in"
-DEFAULT_HEADLESS = True
+DEFAULT_HEADLESS = False
 DEFAULT_ORDER_LIMIT = 5
 MAX_ORDER_LIMIT = 10
 AMAZON_STORAGE_STATE_B64_ENV = "AMAZON_STORAGE_STATE_B64"
@@ -700,11 +700,29 @@ def _is_orders_intent(text: str) -> bool:
 async def _handle_email(session: AmazonSession, user_input: str) -> dict[str, Any]:
     page = session.page
     _LOG.info("[email] start — page=%s input=%r", await _page_diagnostic(page), user_input[:40] if user_input else "")
-    email_node = await _find_email_node(page)
+
+    # Settle any in-progress navigation before querying the DOM.
+    # Amazon's JS can trigger redirects/refreshes after initial load;
+    # if the page is mid-navigation, locator.count() hangs indefinitely.
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=6000)
+    except PlaywrightTimeoutError:
+        pass
+
+    try:
+        email_node = await asyncio.wait_for(_find_email_node(page), timeout=12.0)
+    except asyncio.TimeoutError:
+        _LOG.warning("[email] _find_email_node timed out — page may be in mid-navigation, re-navigating")
+        email_node = None
+
     if email_node is None:
         _LOG.info("[email] email input not found, re-navigating to signin")
         await _goto_signin(page, session.marketplace)
-        email_node = await _find_email_node(page)
+        try:
+            email_node = await asyncio.wait_for(_find_email_node(page), timeout=12.0)
+        except asyncio.TimeoutError:
+            _LOG.warning("[email] _find_email_node timed out again after re-nav")
+            email_node = None
 
     if email_node is None:
         _LOG.warning("[email] email input still not found after re-nav: %s", await _page_diagnostic(page))
@@ -1278,7 +1296,7 @@ async def run(params: dict[str, Any]) -> dict[str, Any]:
     worker_loop = _get_worker_loop()
     future = asyncio.run_coroutine_threadsafe(_run_impl(params), worker_loop)
     return await asyncio.get_running_loop().run_in_executor(
-        None, future.result
+        None, lambda: future.result(timeout=120)
     )
 
 
