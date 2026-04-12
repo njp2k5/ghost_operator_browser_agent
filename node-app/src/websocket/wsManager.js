@@ -15,9 +15,17 @@ function createWS(sender, onMessage) {
         openReject = reject;
     });
 
+    let pingInterval;
+
     ws.on("open", () => {
         logger.info("WS open", { sender });
         openResolve(ws);
+        pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.ping();
+                logger.debug("WS ping sent", { sender });
+            }
+        }, 20000);
     });
 
     ws.on("message", async (data) => {
@@ -32,6 +40,7 @@ function createWS(sender, onMessage) {
 
     ws.on("close", () => {
         logger.warn("WS closed", { sender, state: ws.readyState });
+        clearInterval(pingInterval);
         if (ws.readyState !== WebSocket.OPEN) {
             openReject(new Error("WebSocket closed before open"));
         }

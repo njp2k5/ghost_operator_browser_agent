@@ -294,7 +294,7 @@ function renderHeader(title, subtitle) {
 }
 
 function renderHero(body) {
-    return `🔹 *At a glance*\n${normalizeText(body)}`;
+    return normalizeText(body);
 }
 
 function renderSection(title, body) {
