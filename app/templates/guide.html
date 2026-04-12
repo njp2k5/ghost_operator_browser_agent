@@ -9,6 +9,10 @@
   <style>
     /* Lock the page to full height — prevents scrolling the shell on mobile */
     html, body { height: 100%; overflow: hidden; }
+    /* Prevent accidental text selection when tapping buttons on mobile */
+    body { -webkit-user-select: none; user-select: none; }
+    /* Re-enable selection inside fill inputs */
+    input, textarea { -webkit-user-select: text; user-select: text; }
     #browser-canvas { image-rendering: crisp-edges; }
     .pulse-ring { animation: pulse-ring 1.5s ease-out infinite; }
     @keyframes pulse-ring {

@@ -12,13 +12,16 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.session import Session, SessionStatus, Step, StepAction
 from app.services import browser as bm
-from app.services.llm import replan_remaining_steps
+from app.services.llm import replan_remaining_steps, generate_steps_from_scan
 from app.services.memory import save_memory
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 SCREENSHOT_INTERVAL = 0.12   # seconds between frames — JPEG allows much faster streaming
+
+# Sentinel selector: when encountered, scan the live page and generate real steps
+_SCAN_SENTINEL = "__funclink_scan__"
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +351,93 @@ async def websocket_session(websocket: WebSocket, token: str):
                 step_idx += 1
                 continue
 
-            logger.info(f"[WS:{token}] === Step {step_num}/{total_steps}: action={action}, selector={selector}, url={url}")
+            # ----- Scan sentinel: scan the live page, generate real steps -----
+            if selector == _SCAN_SENTINEL:
+                logger.info(f"[WS:{token}] Scan sentinel hit — scanning page for real fields...")
+                try:
+                    await websocket.send_json({"type": "status", "message": "🔍 Analyzing the page to build your steps..."})
+                    page_fields = await bm.scan_page_fields(browser_session)
+                    current_url = browser_session.page.url
+
+                    if page_fields:
+                        logger.info(f"[WS:{token}] Scan found {len(page_fields)} fields: {[f.get('label') for f in page_fields[:10]]}")
+                        new_raw = await generate_steps_from_scan(
+                            task=s_task,
+                            target_url=current_url,
+                            visible_fields=page_fields,
+                            next_step_number=step_num,
+                        )
+                    else:
+                        # No fields found — LLM fallback using task + URL only
+                        logger.warning(f"[WS:{token}] Scan found no fields — falling back to LLM with URL context")
+                        from app.services.llm import generate_steps as _gen_steps
+                        new_raw = await _gen_steps(task=s_task, context="", target_url=current_url)
+                        # Strip the navigate step since we're already there
+                        new_raw = [s for s in new_raw if s.get("action") != "navigate"]
+                        for i, s in enumerate(new_raw):
+                            s["step_number"] = step_num + i
+
+                    if not new_raw:
+                        logger.warning(f"[WS:{token}] Scan-based generation returned empty — skipping sentinel.")
+                        step_idx += 1
+                        continue
+
+                    # Persist: delete sentinel + any remaining undone steps, insert new ones
+                    new_step_dicts = []
+                    async with AsyncSessionLocal() as db:
+                        await db.execute(
+                            delete(Step).where(Step.session_token == token, Step.is_done == False)
+                        )
+                        for s in new_raw:
+                            action_str = s.get("action", "wait").lower()
+                            try:
+                                action_enum = StepAction(action_str)
+                            except ValueError:
+                                action_enum = StepAction.WAIT
+                            new_step = Step(
+                                session_token=token,
+                                step_number=s.get("step_number", step_num),
+                                action=action_enum,
+                                selector=s.get("selector"),
+                                instruction=s.get("instruction", "Follow the on-screen instructions."),
+                                prefill_value=s.get("prefill_value"),
+                                url=s.get("url"),
+                                is_skippable=s.get("is_skippable", False),
+                                is_done=False,
+                            )
+                            db.add(new_step)
+                            await db.flush()
+                            new_step_dicts.append({
+                                "id": new_step.id,
+                                "step_number": new_step.step_number,
+                                "action": action_str,
+                                "selector": new_step.selector,
+                                "instruction": new_step.instruction,
+                                "prefill_value": new_step.prefill_value,
+                                "url": new_step.url,
+                                "is_skippable": new_step.is_skippable,
+                                "is_done": False,
+                            })
+                        await db.commit()
+
+                    # Replace remaining steps in memory
+                    steps = [s for s in steps if s["is_done"]] + new_step_dicts
+                    step_idx = next((i for i, s in enumerate(steps) if not s["is_done"]), len(steps))
+                    replan_grace_remaining = len(new_step_dicts)
+                    logger.info(f"[WS:{token}] Scan complete: {len(new_step_dicts)} real steps generated.")
+                    await websocket.send_json({
+                        "type": "replan",
+                        "message": f"Ready — {len(new_step_dicts)} steps to complete your task.",
+                        "new_total": len(steps),
+                    })
+                    continue  # restart loop with real steps
+
+                except Exception as scan_err:
+                    logger.error(f"[WS:{token}] Scan sentinel failed: {scan_err}\n{traceback.format_exc()}")
+                    step_idx += 1
+                    continue
+
+
 
             # Detect Booking.com specialist selectors (booking:destination, etc.)
             is_booking_step = (selector or "").startswith("booking:")

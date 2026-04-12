@@ -112,6 +112,77 @@ async def generate_steps(
     return steps
 
 
+SCAN_BASED_SYSTEM = """You are a web automation planner.
+The user wants to: {task}
+The browser is currently on: {target_url}
+
+These are the EXACT interactive fields and buttons visible on the page RIGHT NOW:
+{fields_summary}
+
+Generate a minimal step-by-step JSON array to complete the task using ONLY the fields listed above.
+Do NOT invent selectors that are not in the list.
+
+Each step must follow this exact schema:
+{{
+  "step_number": <int, starting from {next_step_number}>,
+  "action": <"fill" | "select" | "click" | "wait">,
+  "selector": <EXACT label text from the visible fields list — no rewording>,
+  "instruction": <short friendly instruction, max 12 words>,
+  "url": null,
+  "prefill_value": <the value to pre-fill, or null>
+}}
+
+RULES:
+- selector MUST exactly match a label from the visible fields list above.
+- Do NOT add a navigate step — the user is already on the page.
+- For text inputs: action = "fill".
+- For dropdowns / radio buttons: action = "select", set prefill_value = the option to pick.
+- For buttons/links: action = "click".
+- Keep the plan MINIMAL — one step per field.
+- Do NOT include markdown, code fences, or explanation — ONLY the raw JSON array.
+"""
+
+
+async def generate_steps_from_scan(
+    task: str,
+    target_url: str,
+    visible_fields: list[dict],
+    next_step_number: int = 2,
+) -> list[dict]:
+    """
+    Generate steps based on what is ACTUALLY visible on the page (scan-first approach).
+    Far more accurate than generating from the task description alone.
+    """
+    fields_summary = "\n".join(
+        f"  - label=\"{f.get('label')}\"  type={f.get('type')}  tag={f.get('tag')}"
+        for f in visible_fields
+        if f.get("label")
+    ) or "  (no interactive fields detected)"
+
+    system = SCAN_BASED_SYSTEM.format(
+        task=task,
+        target_url=target_url,
+        fields_summary=fields_summary,
+        next_step_number=next_step_number,
+    )
+
+    response = await client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Generate steps for: {task}"},
+        ],
+        temperature=0.1,
+        max_tokens=1024,
+    )
+    raw = response.choices[0].message.content.strip()
+    steps = _parse_json_steps(raw)
+    # Ensure step numbers start from next_step_number
+    for i, s in enumerate(steps):
+        s["step_number"] = next_step_number + i
+    return steps
+
+
 async def replan_remaining_steps(
     task: str,
     completed_steps: list[dict],
