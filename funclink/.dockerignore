@@ -1,0 +1,33 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Secrets (NEVER ship to the image) ────────────────────────────────────────
+.env
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Playwright test artefacts ─────────────────────────────────────────────────
+test-results/
+playwright-report/
+*.png
+
+# ── Ad-hoc test / debug scripts (not needed in production) ───────────────────
+test_*.py
+check_*.py
+debug_*.py
+demo_*.py
+show_*.py
+*.log

@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- viewport-fit=cover fills iPhone notch area -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>FuncLink — Guided Session</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Lock the page to full height — prevents scrolling the shell on mobile */
+    html, body { height: 100%; overflow: hidden; }
+    /* Prevent accidental text selection when tapping buttons on mobile */
+    body { -webkit-user-select: none; user-select: none; }
+    /* Re-enable selection inside fill inputs */
+    input, textarea { -webkit-user-select: text; user-select: text; }
+    #browser-canvas { image-rendering: crisp-edges; }
+    .pulse-ring { animation: pulse-ring 1.5s ease-out infinite; }
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0 rgba(34,211,238,0.5); }
+      70%  { box-shadow: 0 0 0 12px rgba(34,211,238,0); }
+      100% { box-shadow: 0 0 0 0 rgba(34,211,238,0); }
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-white h-full flex flex-col overflow-hidden">
+
+  <!-- Header -->
+  <header class="bg-gray-900 border-b border-gray-800 px-4 py-2 flex items-center gap-3 flex-none">
+    <div class="w-3 h-3 rounded-full bg-cyan-400 flex-none pulse-ring"></div>
+    <span class="font-semibold text-sm tracking-wide text-cyan-400 flex-none">FuncLink</span>
+    <span class="text-gray-400 text-sm flex-none">|</span>
+    <span id="task-label" class="text-gray-300 text-sm truncate min-w-0">{{ task }}</span>
+  </header>
+
+  <!-- Step progress bar -->
+  <div class="bg-gray-900 px-4 py-2 border-b border-gray-800 flex-none">
+    <div class="flex items-center justify-between mb-1">
+      <span id="step-label" class="text-xs text-gray-400 truncate pr-2">Connecting...</span>
+      <span id="step-count" class="text-xs text-cyan-400 font-mono flex-none"></span>
+    </div>
+    <div class="w-full bg-gray-800 rounded-full h-1.5">
+      <div id="progress-bar" class="bg-cyan-400 h-1.5 rounded-full transition-all duration-500" style="width: 0%"></div>
+    </div>
+  </div>
+
+  <!-- Main content — column on mobile, row on desktop -->
+  <div class="flex flex-col lg:flex-row flex-1 min-h-0">
+
+    <!-- Browser viewport -->
+    <!-- Mobile: fixed height (~40% of typical phone screen), Desktop: fills remaining space -->
+    <div class="relative bg-black flex items-center justify-center overflow-hidden
+                flex-none h-40 sm:h-52
+                lg:flex-1 lg:h-auto">
+      <img id="browser-view" class="max-w-full max-h-full object-contain" alt="Browser view" />
+      <!-- Overlay when loading -->
+      <div id="loading-overlay" class="absolute inset-0 bg-gray-950 flex flex-col items-center justify-center gap-4">
+        <div id="loading-spinner" class="w-10 h-10 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin"></div>
+        <p id="overlay-msg" class="text-gray-400 text-sm text-center px-6">Starting guided session...</p>
+        <button id="retry-btn" onclick="connect()" class="hidden mt-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-sm">↺ Retry</button>
+      </div>
+    </div>
+
+    <!-- Instruction panel — fills remaining height on mobile, fixed width on desktop -->
+    <div class="flex-1 min-h-0 lg:flex-none lg:w-80
+                bg-gray-900 border-t lg:border-t-0 lg:border-l border-gray-800
+                flex flex-col overflow-hidden">
+
+      <!-- Scrollable instruction content -->
+      <div class="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+
+        <div id="instruction-card" class="bg-gray-800 rounded-xl p-4 border border-gray-700 hidden">
+          <div class="flex items-start gap-3">
+            <div id="action-icon" class="text-2xl mt-0.5 flex-none">👆</div>
+            <div class="min-w-0">
+              <p id="action-label" class="text-xs text-cyan-400 font-semibold uppercase tracking-widest mb-1">Action</p>
+              <p id="instruction-text" class="text-white text-sm leading-relaxed break-words"></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Input capture (shown for FILL steps) -->
+        <div id="fill-box" class="hidden">
+          <label class="text-xs text-gray-400 mb-1 block">Enter value:</label>
+          <!-- text-base = 16px prevents iOS auto-zoom on focus -->
+          <input id="fill-input" type="text"
+            inputmode="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+            class="w-full bg-gray-800 border border-cyan-500 rounded-lg px-3 py-3
+                   text-white text-base focus:outline-none focus:ring-2 focus:ring-cyan-400"
+            placeholder="Type here..."
+          />
+        </div>
+
+        <!-- Status messages -->
+        <div id="status-msg" class="text-xs text-gray-500 text-center hidden"></div>
+
+        <!-- Completion banner -->
+        <div id="complete-banner" class="hidden text-center py-6">
+          <div class="text-5xl mb-3">🎉</div>
+          <p class="text-cyan-400 font-bold text-lg">All steps complete!</p>
+          <p class="text-gray-400 text-sm mt-1">You can close this window.</p>
+        </div>
+
+      </div>
+
+      <!-- Done button — always pinned to bottom of panel, never hidden behind keyboard -->
+      <div class="flex-none p-3 bg-gray-900 border-t border-gray-800"
+           style="padding-bottom: max(12px, env(safe-area-inset-bottom));">
+        <button id="done-btn"
+          class="w-full bg-cyan-500 hover:bg-cyan-400 active:scale-95
+                 text-gray-950 font-bold py-4 px-6 rounded-xl
+                 transition-all duration-150 text-base hidden
+                 touch-manipulation select-none"
+          onclick="sendDone()">
+          ✓ Done — Next Step
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+    const token   = "{{ token }}";
+    const imgView = document.getElementById('browser-view');
+    let pendingFrame = null;   // latest b64 waiting to be rendered
+    let rafPending  = false;   // requestAnimationFrame in flight
+    let currentAction = null;
+    let ws = null;
+
+    // -----------------------------------------------------------------------
+    // WebSocket connection — auto-detect host so it works on any device
+    // -----------------------------------------------------------------------
+    function log(msg) {
+      console.log('[FuncLink]', msg);
+      const d = document.getElementById('debug-log');
+      if (d) { d.textContent += msg + '\n'; d.scrollTop = d.scrollHeight; }
+    }
+
+    function connect() {
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const host  = window.location.host;
+      const wsUrl = `${proto}://${host}/ws/${token}`;
+      log(`Connecting to ${wsUrl}`);
+
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch(e) {
+        log(`WebSocket constructor error: ${e}`);
+        document.getElementById('overlay-msg').textContent = 'Failed to create WebSocket: ' + e;
+        return;
+      }
+
+      ws.onopen = () => {
+        log('WebSocket OPEN');
+        document.getElementById('step-label').textContent = 'Connected — preparing first step...';
+        document.getElementById('overlay-msg').textContent = 'Connected — launching browser...';
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          log(`MSG: type=${msg.type} ${msg.message || msg.instruction || ''} ${msg.step_number ? 'step='+msg.step_number : ''}`);
+          handleMessage(msg);
+        } catch(e) {
+          log(`Parse error: ${e}`);
+        }
+      };
+
+      ws.onclose = (event) => {
+        log(`WebSocket CLOSED: code=${event.code} reason=${event.reason} clean=${event.wasClean}`);
+        document.getElementById('step-label').textContent = 'Session ended.';
+        const overlay = document.getElementById('loading-overlay');
+        if (!overlay.classList.contains('hidden')) {
+          document.getElementById('loading-spinner').classList.add('hidden');
+          document.getElementById('overlay-msg').textContent = `Connection closed (code ${event.code}). Click Retry.`;
+          document.getElementById('overlay-msg').classList.add('text-red-400');
+          document.getElementById('retry-btn').classList.remove('hidden');
+        }
+      };
+
+      ws.onerror = (e) => {
+        log(`WebSocket ERROR: ${JSON.stringify(e)}`);
+        document.getElementById('loading-spinner').classList.add('hidden');
+        document.getElementById('overlay-msg').textContent = '⚠ Connection error. Please refresh.';
+        document.getElementById('overlay-msg').classList.add('text-red-400');
+        document.getElementById('retry-btn').classList.remove('hidden');
+        showStatus('Connection error. Please refresh.', 'text-red-400');
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // Message handler
+    // -----------------------------------------------------------------------
+    function handleMessage(msg) {
+      if (msg.type === 'status') {
+        document.getElementById('overlay-msg').textContent = msg.message;
+        document.getElementById('step-label').textContent  = msg.message;
+      } else if (msg.type === 'step') {
+        renderStep(msg);
+        renderScreenshot(msg.screenshot);
+        hideOverlay();
+      } else if (msg.type === 'replan') {
+        // LLM has re-planned the remaining steps — update total count
+        log('REPLAN: ' + msg.message + ' (new total=' + msg.new_total + ')');
+        document.getElementById('step-label').textContent = '🔄 ' + msg.message;
+        // Flash the step label cyan for visibility
+        const label = document.getElementById('step-label');
+        label.classList.add('text-cyan-400');
+        setTimeout(() => label.classList.remove('text-cyan-400'), 2000);
+      } else if (msg.type === 'field_not_found') {
+        renderFieldNotFound(msg);
+        renderScreenshot(msg.screenshot);
+        hideOverlay();
+      } else if (msg.type === 'frame') {
+        renderScreenshot(msg.screenshot);
+      } else if (msg.type === 'complete') {
+        showComplete();
+      } else if (msg.type === 'error') {
+        document.getElementById('loading-spinner').classList.add('hidden');
+        document.getElementById('overlay-msg').textContent = '⚠ ' + msg.message;
+        document.getElementById('overlay-msg').classList.add('text-red-400');
+        document.getElementById('retry-btn').classList.remove('hidden');
+        showStatus('⚠ ' + msg.message, 'text-red-400');
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Render step instruction
+    // -----------------------------------------------------------------------
+    const ACTION_ICONS = {
+      navigate:  '🌐',
+      highlight: '👆',
+      fill:      '✏️',
+      select:    '📋',
+      click:     '🖱️',
+      wait:      '⏳',
+    };
+
+    function renderStep(msg) {
+      currentAction = msg.action;
+
+      // Progress bar
+      const pct = Math.round((msg.step_number / msg.total_steps) * 100);
+      document.getElementById('progress-bar').style.width = pct + '%';
+      document.getElementById('step-count').textContent   = `Step ${msg.step_number} / ${msg.total_steps}`;
+      document.getElementById('step-label').textContent   = msg.instruction;
+
+      // Instruction card
+      document.getElementById('action-icon').textContent    = ACTION_ICONS[msg.action] || '👆';
+      document.getElementById('action-label').textContent   = msg.action.toUpperCase();
+      document.getElementById('instruction-text').textContent = msg.instruction;
+      document.getElementById('instruction-card').classList.remove('hidden');
+
+      // Fill input — show for 'fill' and 'select' steps
+      const fillBox = document.getElementById('fill-box');
+      if (msg.action === 'fill') {
+        fillBox.classList.remove('hidden');
+        const inp = document.getElementById('fill-input');
+        // Pre-populate with prefill value so user can see & confirm
+        inp.value = msg.prefill_value || '';
+        if (msg.prefill_value) {
+          inp.placeholder = 'Confirm or change the value, then press Done...';
+          inp.select();  // select all so user can easily replace
+        } else {
+          inp.placeholder = 'Type your value here...';
+        }
+        inp.focus();
+      } else if (msg.action === 'select') {
+        fillBox.classList.remove('hidden');
+        document.getElementById('fill-input').value = msg.prefill_value || '';
+        document.getElementById('fill-input').placeholder = 'Change value or press Done to accept...';
+      } else {
+        fillBox.classList.add('hidden');
+      }
+
+      // Done button
+      document.getElementById('done-btn').classList.remove('hidden');
+      document.getElementById('complete-banner').classList.add('hidden');
+    }
+
+    // -----------------------------------------------------------------------
+    // Render field-not-found notice (auto-skipped step)
+    // -----------------------------------------------------------------------
+    function renderFieldNotFound(msg) {
+      currentAction = null;
+
+      // Progress bar
+      const pct = Math.round((msg.step_number / msg.total_steps) * 100);
+      document.getElementById('progress-bar').style.width = pct + '%';
+      document.getElementById('step-count').textContent   = `Step ${msg.step_number} / ${msg.total_steps}`;
+      document.getElementById('step-label').textContent   = `⏭ Skipped: "${msg.selector}" not on this page`;
+
+      // Instruction card — show as a warning
+      document.getElementById('action-icon').textContent    = '⚠️';
+      document.getElementById('action-label').textContent   = 'SKIPPED';
+      let noticeText = `"${msg.selector}" was not found on the current page. Auto-skipping...`;
+      if (msg.available_fields && msg.available_fields.length > 0) {
+        noticeText += `\n\nVisible fields: ${msg.available_fields.join(', ')}`;
+      }
+      document.getElementById('instruction-text').textContent = noticeText;
+      document.getElementById('instruction-card').classList.remove('hidden');
+
+      // Hide fill box and done button (auto-skip, no user action needed)
+      document.getElementById('fill-box').classList.add('hidden');
+      document.getElementById('done-btn').classList.add('hidden');
+      document.getElementById('complete-banner').classList.add('hidden');
+    }
+
+    // -----------------------------------------------------------------------
+    // Render screenshot — JPEG img tag via requestAnimationFrame (fastest path)
+    // -----------------------------------------------------------------------
+    function renderScreenshot(b64) {
+      if (!b64) return;
+      pendingFrame = b64;
+      if (!rafPending) {
+        rafPending = true;
+        requestAnimationFrame(() => {
+          if (pendingFrame) {
+            imgView.src = 'data:image/jpeg;base64,' + pendingFrame;
+            pendingFrame = null;
+          }
+          rafPending = false;
+        });
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // User presses Done button
+    // -----------------------------------------------------------------------
+    function sendDone() {
+      const fillInput = document.getElementById('fill-input');
+      const value     = (currentAction === 'fill' || currentAction === 'select') ? fillInput.value.trim() : null;
+
+      ws.send(JSON.stringify({ type: 'action_done', value }));
+
+      document.getElementById('done-btn').classList.add('hidden');
+      document.getElementById('step-label').textContent = 'Moving to next step...';
+    }
+
+    // Also allow Enter key on fill inputs
+    document.getElementById('fill-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') sendDone();
+    });
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+    function hideOverlay() {
+      document.getElementById('loading-overlay').classList.add('hidden');
+    }
+
+    function showComplete() {
+      document.getElementById('done-btn').classList.add('hidden');
+      document.getElementById('complete-banner').classList.remove('hidden');
+      document.getElementById('progress-bar').style.width = '100%';
+      document.getElementById('step-label').textContent = 'Task complete!';
+      document.getElementById('instruction-card').classList.add('hidden');
+    }
+
+    function showStatus(msg, cls = 'text-gray-400') {
+      const el = document.getElementById('status-msg');
+      el.textContent = msg;
+      el.className   = `text-xs text-center ${cls}`;
+      el.classList.remove('hidden');
+    }
+
+    // -----------------------------------------------------------------------
+    // Start
+    // -----------------------------------------------------------------------
+    log('Page loaded. Token: ' + token);
+    connect();
+  </script>
+
+</body>
+</html>
